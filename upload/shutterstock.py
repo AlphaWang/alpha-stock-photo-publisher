@@ -76,21 +76,19 @@ def upload(image_path: Path, metadata: dict, context: BrowserContext) -> bool:
         kw_input.press("Enter")
 
         # 8. Fill Category 1 (required) and Category 2 (optional)
-        # MUI Select: click the visible div trigger, then pick the li menu item
+        # data-testid scopes the click to the correct MUI Select, avoiding
+        # accidental matches with other role=button divs (sort, releases, etc.)
         cat1 = metadata.get("category1", "")
         cat2 = metadata.get("category2", "")
-        selects = page.locator("div[role='button'].MuiSelect-select")
-
         if cat1:
-            selects.nth(0).click()
+            page.locator("[data-testid='category1'] div[role='button']").click()
             page.locator(f"li.MuiMenuItem-root:has-text('{cat1}')").first.click()
-
         if cat2:
-            selects.nth(1).click()
+            page.locator("[data-testid='category2'] div[role='button']").click()
             page.locator(f"li.MuiMenuItem-root:has-text('{cat2}')").first.click()
 
-        # 9. Save (contained variant)
-        page.locator("button.MuiButton-contained:has-text('Save')").click()
+        # 9. Save (outlined button, identified by data-testid)
+        page.locator("[data-testid='edit-dialog-save-button']").click()
         page.wait_for_timeout(3_000)
 
         print(f"  ✓ Shutterstock: {image_path.name}")

@@ -20,14 +20,14 @@ Check whether each image in `<path>` already has a matching `*_????????_??????.j
 
 - **Missing JSON → run photo_desc.py first:**
   ```bash
-  python3 /Users/zhongxwang/dev/git/alpha/alpha-photo-desc/photo_desc.py <path>
+  python3 photo_desc.py <path>
   ```
 - **All JSONs present → skip to Step 2**
 
 ### Step 2 — Upload
 
 ```bash
-python3 /Users/zhongxwang/dev/git/alpha/alpha-photo-desc/upload_photos.py <path> --platform <platform> [--dry-run]
+python3 upload_photos.py <path> --platform <platform> [--dry-run]
 ```
 
 ### Step 3 — Report

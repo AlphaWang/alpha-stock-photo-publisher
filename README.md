@@ -1,6 +1,6 @@
-# alpha-photo-desc
+# alpha-stock-photo-publisher
 
-Bilingual stock photo metadata generator and uploader for Shutterstock and 500px.com.cn.
+Bilingual stock photo metadata generator and publisher for Shutterstock and 500px.com.cn.
 
 Given a photo (or a directory of photos), it uses the Claude vision API to generate English and Chinese titles, descriptions, keywords, and categories — then automates the upload via a real browser.
 
@@ -18,8 +18,6 @@ python -m playwright install chromium
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
-
-On the eBay internal network, the token is fetched automatically via `npx @ebay/claude-code-token@latest`.
 
 ## Usage
 

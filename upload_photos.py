@@ -46,7 +46,6 @@ def load_metadata(json_path: Path) -> dict:
 
 def run_upload(pairs: list[tuple[Path, Path]], platform: str) -> None:
     from playwright.sync_api import sync_playwright
-    from upload.shutterstock import upload as ss_upload
     from upload.px500 import upload as px_upload
     from upload.browser import get_context
 
@@ -58,20 +57,27 @@ def run_upload(pairs: list[tuple[Path, Path]], platform: str) -> None:
         px_ctx = get_context("px500", pw) if platform in ("px500", "all") else None
 
         try:
-            for i, (img, jf) in enumerate(pairs, 1):
-                meta = load_metadata(jf)
-                print(f"[{i}/{total}] {img.name}")
+            # Shutterstock: batch upload all images in one file-chooser call
+            if ss_ctx:
+                from upload.shutterstock import upload_batch as ss_batch
+                loaded = [(img, load_metadata(jf)) for img, jf in pairs]
+                batch_results = ss_batch(loaded, ss_ctx)
+                for ok in batch_results.values():
+                    if ok:
+                        results["ok"] += 1
+                    else:
+                        results["fail"] += 1
 
-                ok = True
-                if ss_ctx:
-                    ok &= ss_upload(img, meta, ss_ctx)
-                if px_ctx:
-                    ok &= px_upload(img, meta, px_ctx)
-
-                if ok:
-                    results["ok"] += 1
-                else:
-                    results["fail"] += 1
+            # 500px: still processed one at a time
+            if px_ctx:
+                for i, (img, jf) in enumerate(pairs, 1):
+                    meta = load_metadata(jf)
+                    print(f"[{i}/{total}] {img.name}")
+                    ok = px_upload(img, meta, px_ctx)
+                    if ok:
+                        results["ok"] += 1
+                    else:
+                        results["fail"] += 1
         finally:
             if ss_ctx:
                 ss_ctx.close()

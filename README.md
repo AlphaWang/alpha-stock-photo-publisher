@@ -4,13 +4,6 @@ Bilingual stock photo metadata generator and uploader for Shutterstock and 500px
 
 Given a photo (or a directory of photos), it uses the Claude vision API to generate English and Chinese titles, descriptions, keywords, and categories — then automates the upload via a real browser.
 
-## Workflow
-
-```
-photo_desc.py  →  JSON metadata files
-upload_photos.py  →  browser automation (Playwright)
-```
-
 ## Prerequisites
 
 **Python packages**
@@ -22,26 +15,46 @@ python -m playwright install chromium
 
 **Claude API access**
 
-Set your API key:
-
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-Or if you are on the eBay internal network, the token is fetched automatically via `npx @ebay/claude-code-token@latest`.
+On the eBay internal network, the token is fetched automatically via `npx @ebay/claude-code-token@latest`.
 
-## Step 1 — Generate metadata
+## Usage
+
+### With Claude Code (recommended)
+
+Open this project in [Claude Code](https://claude.ai/code) and run:
+
+```
+/publish-photos /path/to/dir
+/publish-photos /path/to/dir --platform shutterstock
+/publish-photos /path/to/dir --dry-run
+```
+
+Claude handles the full pipeline automatically:
+1. Generate metadata (skips images that already have a JSON)
+2. Upload to the target platform(s)
+3. Report results and guide you through any login prompts
+
+### Without Claude Code
+
+Run the two scripts manually:
 
 ```bash
-# Single image
-python3 photo_desc.py /path/to/photo.jpg
-
-# Whole directory (parallel, 3 workers by default)
+# Step 1 — generate metadata
 python3 photo_desc.py /path/to/dir
 
-# Custom output directory
-python3 photo_desc.py /path/to/dir --output /path/to/output
+# Step 2 — upload
+python3 upload_photos.py /path/to/dir --platform shutterstock
 ```
+
+## First run (browser login)
+
+On the first run for each platform, a browser window opens. Log in with your account (including 2FA), then press Enter in the terminal. The session is saved to `.session/` and reused automatically — no repeated logins needed.
+
+## Output format
 
 Each image produces a timestamped JSON file alongside it, e.g. `DSC00012_20260418_132943.json`:
 
@@ -60,36 +73,7 @@ Each image produces a timestamped JSON file alongside it, e.g. `DSC00012_2026041
 }
 ```
 
-If you run `photo_desc.py` on the same image twice, the newest JSON is used automatically.
-
-## Step 2 — Upload
-
-```bash
-# Upload a single image
-python3 upload_photos.py /path/to/photo.jpg --platform shutterstock
-
-# Upload a whole directory
-python3 upload_photos.py /path/to/dir --platform shutterstock
-
-# Both platforms
-python3 upload_photos.py /path/to/dir --platform all
-
-# Preview without uploading
-python3 upload_photos.py /path/to/dir --dry-run
-```
-
-**First run:** A browser window opens. Log in with your account (including 2FA if required), then press Enter in the terminal. The session is saved to `.session/` and reused on future runs — no repeated logins needed.
-
-## Claude Code skill
-
-If you use [Claude Code](https://claude.ai/code), a `/upload-photos` skill is included:
-
-```
-/upload-photos /path/to/dir --platform shutterstock
-/upload-photos /path/to/dir --dry-run
-```
-
-Claude will run the upload script and report the result.
+If you run metadata generation on the same image twice, the newest JSON is used automatically.
 
 ## Platform limits (enforced automatically)
 
@@ -99,28 +83,22 @@ Claude will run the upload script and report the result.
 | Keywords | exactly 50 | exactly 35 |
 | Categories | 1 required + 1 optional | — |
 
+## Supported image formats
+
+`.jpg` `.jpeg` `.png` `.gif` `.webp`
+
 ## Project structure
 
 ```
 photo_desc.py          # metadata generator (Claude vision API)
-upload_photos.py       # CLI entry point for uploads
+upload_photos.py       # upload CLI
 upload/
   browser.py           # shared: persistent browser context, login helper
   shutterstock.py      # Shutterstock upload automation
-  px500.py             # 500px.com.cn upload automation (not yet tested)
+  px500.py             # 500px.com.cn upload automation
 debug_selectors.py     # interactive DOM inspector for debugging selectors
 .claude/skills/
-  upload-photos/
-    SKILL.md           # /upload-photos Claude Code skill
+  publish-photos/
+    SKILL.md           # /publish-photos Claude Code skill
 .session/              # browser sessions (git-ignored)
 ```
-
-## Session management
-
-Browser sessions are stored in `.session/shutterstock/` and `.session/px500/` (git-ignored). They persist across runs — you only need to log in once per platform.
-
-If a session expires, the browser reopens automatically and prompts you to log in again.
-
-## Supported image formats
-
-`.jpg` `.jpeg` `.png` `.gif` `.webp`

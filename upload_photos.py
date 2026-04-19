@@ -46,7 +46,7 @@ def load_metadata(json_path: Path) -> dict:
 
 def run_upload(pairs: list[tuple[Path, Path]], platform: str) -> None:
     from playwright.sync_api import sync_playwright
-    from upload.px500 import upload as px_upload
+    import upload.px500 as _px500
     from upload.browser import get_context
 
     total = len(pairs)
@@ -68,12 +68,12 @@ def run_upload(pairs: list[tuple[Path, Path]], platform: str) -> None:
                     else:
                         results["fail"] += 1
 
-            # 500px: still processed one at a time
+            # 500px: batch — select all files at once, fill metadata per draft page
             if px_ctx:
-                for i, (img, jf) in enumerate(pairs, 1):
-                    meta = load_metadata(jf)
-                    print(f"[{i}/{total}] {img.name}")
-                    ok = px_upload(img, meta, px_ctx)
+                _px500.ensure_login(px_ctx)
+                loaded = [(img, load_metadata(jf)) for img, jf in pairs]
+                batch_results = _px500.upload_batch(loaded, px_ctx)
+                for ok in batch_results.values():
                     if ok:
                         results["ok"] += 1
                     else:

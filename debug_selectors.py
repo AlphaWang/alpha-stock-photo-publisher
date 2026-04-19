@@ -15,7 +15,7 @@ from upload.browser import get_context
 
 PLATFORMS = {
     "shutterstock": "https://submit.shutterstock.com/",
-    "px500": "https://500px.com.cn/",
+    "px500": "https://creatorstudio.500px.com.cn/index",
 }
 
 

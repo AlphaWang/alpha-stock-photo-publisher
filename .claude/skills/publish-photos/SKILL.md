@@ -1,15 +1,15 @@
 # publish-photos
 
-End-to-end stock photo pipeline: generate bilingual metadata with Claude vision, then upload to Shutterstock and/or 500px.com.cn.
+End-to-end stock photo pipeline: generate bilingual metadata with Claude vision, then upload to Shutterstock, 500px.com.cn, and/or 图虫创意.
 
 ## Usage
 
 ```
-/publish-photos <path> [--platform shutterstock|px500|all] [--dry-run]
+/publish-photos <path> [--platform shutterstock|px500|tuchong|all] [--dry-run]
 ```
 
 - `<path>` — image file or directory of images
-- `--platform` — target platform (default: `all`)
+- `--platform` — target platform (default: `all`); `tuchong` = 图虫创意
 - `--dry-run` — preview what would run without executing
 
 ## What this skill does

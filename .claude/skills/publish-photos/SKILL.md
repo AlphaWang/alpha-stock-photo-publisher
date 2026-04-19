@@ -20,8 +20,9 @@ Check whether each image in `<path>` already has a matching `*_????????_??????.j
 
 - **Missing JSON → run photo_desc.py first:**
   ```bash
-  python3 photo_desc.py <path>
+  python3 photo_desc.py <path> [--context "<context>"]
   ```
+  If the user provided any descriptive text beyond the path and flags (e.g. location, scene, shooting conditions), pass it as `--context`.
 - **All JSONs present → skip to Step 2**
 
 ### Step 2 — Upload
@@ -52,4 +53,10 @@ The session is saved to `.session/` and reused automatically on future runs.
 /publish-photos ~/Photo/2026-04-15/4 --platform shutterstock
 /publish-photos ~/Photo/2026-04-15/4 --dry-run
 /publish-photos ~/Photo/2026-04-15/4/DSC00012.jpg --platform shutterstock
+```
+
+With context:
+```
+/publish-photos ~/Photo/2026-04-15/4 --platform shutterstock
+Shot at San Simeon along California Highway 1, featuring elephant seals, a lighthouse, and sunset coastal scenery
 ```

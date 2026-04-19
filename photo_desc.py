@@ -15,6 +15,7 @@ import io
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -22,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 
 import anthropic
+import httpx
 from PIL import Image
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
@@ -49,72 +51,72 @@ SHUTTERSTOCK_CATEGORIES = [
     "Sports/Recreation", "Technology", "Transportation", "Vintage",
 ]
 
-SYSTEM_PROMPT = f"""你是一位专业的图库图片编辑，擅长为 Shutterstock、500px 等平台优化图片元数据。
-你的目标是生成能吸引买家搜索并促成购买的标题、描述和关键词。
+SYSTEM_PROMPT = f"""You are a professional stock photo editor specializing in optimizing image metadata for platforms like Shutterstock and 500px.
+Your goal is to generate titles, descriptions, and keywords that attract buyers through search and drive purchases.
 
-各平台限制（必须严格遵守）：
-- description_en（Shutterstock）：不超过 {SHUTTERSTOCK_DESC_MAX} 个字符
-- description_zh（500px.com.cn）：不超过 {PX500_DESC_MAX} 个字符，务必简洁
-- keywords_en（Shutterstock）：恰好 {SHUTTERSTOCK_KW_MAX} 个，全部小写
-- keywords_zh（500px.com.cn）：恰好 {PX500_KW_MAX} 个
+Platform limits (strictly enforced):
+- description_en (Shutterstock): max {SHUTTERSTOCK_DESC_MAX} characters
+- description_zh (500px.com.cn): max {PX500_DESC_MAX} characters, keep concise
+- keywords_en (Shutterstock): exactly {SHUTTERSTOCK_KW_MAX}, all lowercase
+- keywords_zh (500px.com.cn): exactly {PX500_KW_MAX}
 
-关键词从最重要到最次要排列，覆盖主体/颜色/情绪/场景/风格/用途等维度。
+Arrange keywords from most to least important, covering subject/color/mood/scene/style/use-case dimensions.
 
-Shutterstock 分类（category1 必填，category2 可选）必须从以下列表中精确选择：
+Shutterstock categories (category1 required, category2 optional) must be chosen exactly from this list:
 {", ".join(SHUTTERSTOCK_CATEGORIES)}
 
-输出格式必须是严格的 JSON，不包含任何 markdown 代码块标记：
+Output must be strict JSON with no markdown code fences:
 {{
   "title_en": "English title",
-  "title_zh": "中文标题",
+  "title_zh": "Chinese title",
   "description_en": "Shutterstock description (max {SHUTTERSTOCK_DESC_MAX} chars)",
-  "description_zh": "500px中文描述（最多{PX500_DESC_MAX}字）",
+  "description_zh": "500px Chinese description (max {PX500_DESC_MAX} chars)",
   "keywords_en": ["keyword1", ..., "keyword{SHUTTERSTOCK_KW_MAX}"],
-  "keywords_zh": ["关键词1", ..., "关键词{PX500_KW_MAX}"],
+  "keywords_zh": ["Chinese keyword 1", ..., "Chinese keyword {PX500_KW_MAX}"],
   "category1": "Primary Shutterstock category (required)",
-  "category2": "Secondary Shutterstock category (optional, omit if not applicable)"
+  "category2": "Secondary Shutterstock category (optional, omit if not applicable)",
+  "location_zh": "Shooting location in Chinese, city-level preferred (e.g. 旧金山, 洛杉矶, 纽约). Infer from context or visual cues; omit field if truly unknown.",
+  "core_keywords_zh": ["most objective keyword 1", "...", "up to 5 total — pick from keywords_zh, most objective subject terms first"]
 }}"""
 
 
-def get_api_key() -> str:
-    """Return the API token, fetching it via the eBay helper if not set in the environment."""
-    if key := os.environ.get("ANTHROPIC_API_KEY"):
-        return key
+_GATEWAY_URL = os.environ.get("CLAUDE_GATEWAY_URL", "")
+_TOKEN_CMD = os.environ.get("CLAUDE_TOKEN_CMD", "npx @ebay/claude-code-token@latest get_token")
+
+
+class _BearerAuth(httpx.Auth):
+    def __init__(self, token: str):
+        self._token = token
+
+    def auth_flow(self, request):
+        request.headers["Authorization"] = f"Bearer {self._token}"
+        yield request
+
+
+def _get_token() -> str:
     try:
         result = subprocess.run(
-            ["npx", "@ebay/claude-code-token@latest", "get_token"],
-            capture_output=True,
-            text=True,
-            timeout=30,
+            shlex.split(_TOKEN_CMD), capture_output=True, text=True, check=True,
         )
-        token = result.stdout.strip()
-        if token:
-            return token
-    except Exception as e:
-        sys.exit(f"Failed to obtain API token: {e}")
-    sys.exit("Failed to obtain API token. Set ANTHROPIC_API_KEY or ensure the eBay token helper is available.")
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"Token command failed: {e.stderr.strip() or e.stdout.strip()}")
 
 
 def make_client() -> anthropic.Anthropic:
-    token = get_api_key()
-    base_url = os.environ.get(
-        "ANTHROPIC_BASE_URL",
-        "https://platformgateway2.vip.ebay.com/hubgptgatewaysvc/v1/anthropic",
-    )
-
-    import httpx
-
-    # The eBay gateway requires Bearer auth; override the SDK's default x-api-key injection.
-    class BearerAuth(httpx.Auth):
-        def auth_flow(self, request):
-            request.headers["Authorization"] = f"Bearer {token}"
-            request.headers.pop("x-api-key", None)
-            yield request
-
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if api_key:
+        return anthropic.Anthropic(api_key=api_key)
+    if not _GATEWAY_URL:
+        sys.exit(
+            "Set ANTHROPIC_API_KEY or CLAUDE_GATEWAY_URL + CLAUDE_TOKEN_CMD. "
+            "See .env.example for details."
+        )
+    token = _get_token()
     return anthropic.Anthropic(
         api_key="placeholder",
-        base_url=base_url,
-        http_client=httpx.Client(auth=BearerAuth()),
+        base_url=_GATEWAY_URL,
+        http_client=httpx.Client(auth=_BearerAuth(token)),
     )
 
 
@@ -131,8 +133,10 @@ def load_image(path: Path) -> tuple[str, str]:
     return base64.standard_b64encode(buf.getvalue()).decode(), "image/jpeg"
 
 
-def analyze_image(image_path: Path, client: anthropic.Anthropic) -> dict:
+def analyze_image(image_path: Path, client: anthropic.Anthropic, context: str = "") -> dict:
     data, media_type = load_image(image_path)
+
+    context_note = f"\n\nShooting context (use this to improve description accuracy and keyword commercial value): {context}" if context else ""
 
     response = client.messages.create(
         model=get_model(),
@@ -153,11 +157,12 @@ def analyze_image(image_path: Path, client: anthropic.Anthropic) -> dict:
                     {
                         "type": "text",
                         "text": (
-                            "请分析这张图片并生成适合图库销售的元数据。"
-                            "严格返回 JSON 格式，不要任何额外文字或代码块标记。"
-                            f"keywords_en 恰好 {SHUTTERSTOCK_KW_MAX} 个，"
-                            f"keywords_zh 恰好 {PX500_KW_MAX} 个，"
-                            f"description_zh 不超过 {PX500_DESC_MAX} 个字符。"
+                            "Analyze this image and generate stock photo metadata optimized for commercial sales. "
+                            "Return strict JSON only — no extra text, no markdown code fences. "
+                            f"keywords_en: exactly {SHUTTERSTOCK_KW_MAX}, all lowercase. "
+                            f"keywords_zh: exactly {PX500_KW_MAX} Chinese keywords. "
+                            f"description_zh: max {PX500_DESC_MAX} characters."
+                            + context_note
                         ),
                     },
                 ],
@@ -194,9 +199,9 @@ def write_json(result: dict, image_path: Path, output_dir: Path) -> Path:
     return out_file
 
 
-def process_one(image_path: Path, output_dir: Path, client: anthropic.Anthropic) -> tuple[Path, bool, str]:
+def process_one(image_path: Path, output_dir: Path, client: anthropic.Anthropic, context: str = "") -> tuple[Path, bool, str]:
     try:
-        result = enforce_limits(analyze_image(image_path, client))
+        result = enforce_limits(analyze_image(image_path, client, context))
         out_file = write_json(result, image_path, output_dir)
         return image_path, True, str(out_file)
     except Exception as e:
@@ -224,6 +229,7 @@ def main():
     parser.add_argument("target", help="Image file or directory of images")
     parser.add_argument("--output", "-o", default=None, help="Output directory (default: same directory as the image)")
     parser.add_argument("--workers", "-w", type=int, default=3, help="Parallel workers for batch mode (default: 3)")
+    parser.add_argument("--context", "-c", default="", help="Additional context about the photos (e.g. location, scene, shooting conditions)")
     args = parser.parse_args()
 
     target = Path(args.target).expanduser().resolve()
@@ -241,8 +247,11 @@ def main():
     def output_for(img: Path) -> Path:
         return fixed_output or img.parent
 
+    if args.context:
+        print(f"Context: {args.context}")
+
     if total == 1:
-        img, ok, info = process_one(images[0], output_for(images[0]), client)
+        img, ok, info = process_one(images[0], output_for(images[0]), client, args.context)
         if ok:
             print(f"✓ {img.name} → {info}")
         else:
@@ -252,7 +261,7 @@ def main():
     done = 0
     failed = []
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(process_one, img, output_for(img), client): img for img in images}
+        futures = {executor.submit(process_one, img, output_for(img), client, args.context): img for img in images}
         for future in as_completed(futures):
             img, ok, info = future.result()
             done += 1

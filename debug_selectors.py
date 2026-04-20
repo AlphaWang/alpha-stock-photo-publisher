@@ -16,6 +16,8 @@ from upload.browser import get_context
 PLATFORMS = {
     "shutterstock": "https://submit.shutterstock.com/",
     "px500": "https://creatorstudio.500px.com.cn/index",
+    "tuchong": "https://contributor.tuchong.com/contribute?category=0",
+    "adobestock": "https://contributor.stock.adobe.com/",
 }
 
 
@@ -53,7 +55,7 @@ def dump_elements(page):
 def main():
     platform = sys.argv[1] if len(sys.argv) > 1 else "shutterstock"
     if platform not in PLATFORMS:
-        sys.exit(f"Unknown platform: {platform}. Choose: {', '.join(PLATFORMS)}")
+        sys.exit(f"Unknown platform: {platform}. Choices: {', '.join(PLATFORMS)}")
 
     url = PLATFORMS[platform]
 

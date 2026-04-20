@@ -1,8 +1,21 @@
 # alpha-stock-photo-publisher
 
-Bilingual stock photo metadata generator and publisher for Shutterstock and 500px.com.cn.
+Bilingual stock photo metadata generator and publisher for Shutterstock, 500px.com.cn, Tuchong, and Adobe Stock.
 
 Given a photo (or a directory of photos), it uses the Claude vision API to generate English and Chinese titles, descriptions, keywords, and categories — then automates the upload via a real browser.
+
+## Supported platforms
+
+| Platform | URL | Status |
+|---|---|---|
+| Shutterstock | https://www.shutterstock.com | ✅ Supported |
+| 500px.com.cn / 视觉中国 (VCG) | https://500px.com.cn · https://www.vcg.com | ✅ Supported |
+| 图虫创意 (Tuchong) | https://tuchong.com | ✅ Supported |
+| Getty Images / iStock | https://contributor.gettyimages.com | ⚠️ Implementing |
+| Adobe Stock | https://stock.adobe.com | ✅ Supported |
+| Alamy | https://www.alamy.com | — |
+| Dreamstime | https://www.dreamstime.com | — |
+| 全景图片 (Quanjing) | https://www.quanjing.com | — |
 
 ## Prerequisites
 
@@ -28,6 +41,7 @@ Open this project in [Claude Code](https://claude.ai/code) and run:
 ```
 /publish-photos /path/to/dir
 /publish-photos /path/to/dir --platform shutterstock
+/publish-photos /path/to/dir --platform adobestock
 /publish-photos /path/to/dir --dry-run
 ```
 
@@ -75,11 +89,11 @@ If you run metadata generation on the same image twice, the newest JSON is used 
 
 ## Platform limits (enforced automatically)
 
-| Field | Shutterstock | 500px.com.cn |
-|---|---|---|
-| Description | ≤ 2048 chars | ≤ 50 chars |
-| Keywords | exactly 50 | exactly 35 |
-| Categories | 1 required + 1 optional | — |
+| Field | Shutterstock | 500px.com.cn | Adobe Stock | Getty / iStock |
+|---|---|---|---|---|
+| Title / Description | ≤ 2048 chars | ≤ 50 chars | title ≤ 200 chars | title ≤ 200 chars |
+| Keywords | exactly 50 | exactly 35 | 15–49 (ordered by relevance) | ≤ 50 |
+| Categories | 1 required + 1 optional | — | 1 required (from 16 fixed options) | 1 required |
 
 ## Supported image formats
 
@@ -94,6 +108,8 @@ upload/
   browser.py           # shared: persistent browser context, login helper
   shutterstock.py      # Shutterstock upload automation
   px500.py             # 500px.com.cn upload automation
+  tuchong.py           # Tuchong upload automation
+  adobestock.py        # Adobe Stock upload automation
 debug_selectors.py     # interactive DOM inspector for debugging selectors
 .claude/skills/
   publish-photos/

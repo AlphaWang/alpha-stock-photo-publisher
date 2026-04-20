@@ -2,11 +2,11 @@
 contributor.tuchong.com creative-photo upload automation.
 
 Upload flow (contributor.tuchong.com):
-  1. Navigate to creative-image upload page ("创意图片")
-  2. Click "添加图片" → file chooser; select ALL images at once
-  3. Wait for all uploads to complete (no "上传中" indicators remaining)
+  1. Navigate to the creative-image upload page
+  2. Click the add-images button → file chooser; select ALL images at once
+  3. Wait for all uploads to complete (no in-progress indicators remaining)
   4. For each image: click thumbnail → fill right-panel metadata
-  5. Select all → "提交选中的素材"
+  5. Select all → save draft
 
 NOTE: Selectors based on contributor.tuchong.com UI as of 2026-04. Update if the site changes.
 """
@@ -20,7 +20,7 @@ from .browser import ensure_logged_in
 LOGIN_URL  = "https://contributor.tuchong.com/"
 UPLOAD_URL = "https://contributor.tuchong.com/contribute?category=0"
 
-# Map Shutterstock category1 → 图虫创意 摄影图片类 tags (max 2)
+# Map Shutterstock category1 → Tuchong photo-category tags (max 2)
 _CATEGORY_MAP: dict[str, list[str]] = {
     "Nature":       ["自然风光"],
     "Travel":       ["自然风光", "城市风光"],
@@ -58,7 +58,7 @@ def ensure_login(context: BrowserContext) -> None:
 
 
 def _resolve_categories(category1: str) -> list[str]:
-    """Map Shutterstock category1 to 图虫 摄影图片类 tags."""
+    """Map Shutterstock category1 to Tuchong photo-category tags."""
     for key, tags in _CATEGORY_MAP.items():
         if key.lower() in category1.lower():
             return tags[:2]
@@ -74,21 +74,21 @@ def _fill_metadata(page: Page, metadata: dict) -> None:
     except PWTimeout:
         form = page  # fallback
 
-    # 是否独家 → 否  (span.btn-default, not <button>)
+    # "Exclusive?" field — select No  (span.btn-default, not <button>)
     try:
         form.locator("span.btn-default").filter(has_text="否").first.click(timeout=5_000)
         page.wait_for_timeout(200)
     except PWTimeout:
         pass
 
-    # 图片用途: already "商业广告类" by default — no action needed
+    # Image usage: defaults to commercial/advertising — no action needed
 
-    # 图片分类 — <input class="ant-input" placeholder="请选择"> opens a modal
+    # Image category — <input class="ant-input" placeholder="请选择"> opens a modal
     cats = _resolve_categories(metadata.get("category1", ""))
     try:
         form.locator("input.ant-input[placeholder='请选择']").click(timeout=5_000)
         # Wait for modal to appear AND let its CSS animation finish before clicking.
-        # page.locator("text=摄影图片类") resolves as soon as the DOM node exists,
+        # The locator resolves as soon as the DOM node exists,
         # but clicks during the slide-in animation are often dropped by the browser.
         page.wait_for_selector("text=摄影图片类", timeout=10_000)
         page.wait_for_timeout(600)
@@ -109,9 +109,9 @@ def _fill_metadata(page: Page, metadata: dict) -> None:
         page.locator("button:has-text('确认'), button:has-text('确 认')").first.click(timeout=5_000)
         page.wait_for_timeout(1_000)  # wait for modal to close fully
     except PWTimeout as e:
-        print(f"  [warn] 图片分类 failed: {e}")
+        print(f"  [warn] category field failed: {e}")
 
-    # 图片说明 — <textarea class="ant-input contribute-form-model" maxlength="50">
+    # Image description — <textarea class="ant-input contribute-form-model" maxlength="50">
     desc = metadata.get("description_zh", "")[:50]
     try:
         ta = form.locator("textarea.ant-input").first
@@ -129,9 +129,9 @@ def _fill_metadata(page: Page, metadata: dict) -> None:
         ta.type(desc, delay=20)
         page.wait_for_timeout(200)
     except Exception as e:
-        print(f"  [warn] 图片说明 failed: {e}")
+        print(f"  [warn] description field failed: {e}")
 
-    # 关键词 — Ant Design Select (tags/multiple mode)
+    # Keywords — Ant Design Select (tags/multiple mode)
     # .ant-select-selection--multiple contains a hidden input.ant-select-search__field
     keywords = metadata.get("keywords_zh", [])[:30]
     if keywords:
@@ -146,11 +146,11 @@ def _fill_metadata(page: Page, metadata: dict) -> None:
                 kw_input.press("Enter")
                 page.wait_for_timeout(80)
         except Exception as e:
-            print(f"  [warn] 关键词 failed: {e}")
+            print(f"  [warn] keywords field failed: {e}")
 
 
 def _check_pledge(page: Page) -> None:
-    """Tick the 本人郑重承诺 checkbox before submitting."""
+    """Tick the pledge/agreement checkbox before submitting."""
     try:
         # The checkbox is in a label block at the bottom of the page
         chk = page.locator("input[type='checkbox']").filter(has=page.locator("text=本人郑重承诺")).first
@@ -199,7 +199,7 @@ def _card_error(page: Page, filename: str) -> str | None:
 
 
 def _delete_card(page: Page, filename: str) -> None:
-    """Click the 删除 button on an error card."""
+    """Click the delete/retry button on an error card."""
     page.evaluate(
         """(filename) => {
             const cards = [...document.querySelectorAll('.contribute__image__item')];
@@ -244,9 +244,9 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
             fc_info.value.set_files([str(img) for img, _ in to_upload])
 
             if upload_round == 0:
-                print(f"  Uploading {total} image(s) to 图虫创意...")
+                print(f"  Uploading {total} image(s) to Tuchong...", flush=True)
             else:
-                print(f"  Retrying {len(to_upload)} image(s) after Network Error...")
+                print(f"  Retrying {len(to_upload)} image(s) after Network Error...", flush=True)
 
             _wait_for_uploads(page, len(to_upload))
 
@@ -260,14 +260,14 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
                     _delete_card(page, img.name)
                     retry.append((img, metadata))
                 else:
-                    print(f"  [skip] {img.name}: {err}")
+                    print(f"  [skip] {img.name}: {err}", flush=True)
 
             to_upload = retry
             if retry and upload_round < 2:
                 page.wait_for_timeout(2_000)
 
         for img, _ in to_upload:
-            print(f"  [fail] {img.name}: Network Error after 3 attempts")
+            print(f"  [fail] {img.name}: Network Error after 3 attempts", flush=True)
 
         # --- Metadata fill phase ---
         # Cards are looked up by filename, not by index, because deletions and
@@ -315,12 +315,12 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
             page.wait_for_timeout(300)
 
             _fill_metadata(page, metadata)
-            print(f"  [{fill_idx + 1}/{len(ok_pairs)}] ✓ {img.name}")
+            print(f"  [{fill_idx + 1}/{len(ok_pairs)}] ✓ {img.name}", flush=True)
             results[img.name] = True
 
         # After all images are filled, select all and save draft once.
         # Each card's metadata is already in React state from the individual fills;
-        # 保存草稿 with all selected persists all of them in one shot.
+        # saving with all selected persists all of them in one shot.
         _check_pledge(page)
         try:
             all_chk = page.locator("label:has-text('全选') input[type='checkbox']").first
@@ -335,11 +335,11 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
             page.locator("button:has-text('保存草稿')").first.click(timeout=5_000)
             page.wait_for_timeout(2_000)
         except PWTimeout:
-            print("  [warn] 保存草稿 failed")
+            print("  [warn] save-draft failed")
 
     except Exception as e:
         step = f"at image {fill_idx + 1}" if fill_idx >= 0 else "before fill loop"
-        print(f"  ✗ 图虫创意 batch failed {step}: {e}")
+        print(f"  ✗ Tuchong batch failed {step}: {e}", flush=True)
     finally:
         page.close()
 

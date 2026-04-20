@@ -25,17 +25,27 @@ Check whether each image in `<path>` already has a matching `*_????????_??????.j
   If the user provided any descriptive text beyond the path and flags (e.g. location, scene, shooting conditions), pass it as `--context`.
 - **All JSONs present → skip to Step 2**
 
-### Step 2 — Upload
+### Step 2 — Upload (with live progress)
+
+Run the upload in the **background** using `run_in_background=True` on the Bash tool:
 
 ```bash
-python3 upload_photos.py <path> --platform <platform> [--dry-run]
+PYTHONUNBUFFERED=1 python3 upload_photos.py <path> --platform <platform> [--dry-run]
 ```
+
+Then **poll for progress** using `TaskOutput(task_id=<id>, block=False, timeout=5000)`:
+
+- Keep track of how many characters of output you've already seen (`seen` index).
+- After each poll, slice `output[seen:]` to extract only new text, then advance `seen`.
+- Immediately print any new lines to the user as plain text.
+- Poll every ~15 seconds. Stop once the output contains `Done:` or the task finishes.
+- Do a final blocking `TaskOutput(block=True)` to capture any trailing output.
 
 ### Step 3 — Report
 
-After the script finishes, report:
-- How many images succeeded / failed
-- Any error messages for failed images
+After the task completes, report:
+- How many images succeeded / failed (from the `Done: N/M succeeded` line)
+- Any `[warn]` or `[fail]` error messages for failed images
 - Remind the user to check the browser if a login prompt appears
 
 ## Login (first run)

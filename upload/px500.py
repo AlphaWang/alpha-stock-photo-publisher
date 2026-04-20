@@ -2,8 +2,8 @@
 500px.com.cn contributor upload automation.
 
 Upload flow (creatorstudio.500px.com.cn):
-  1. Click "我要供稿" → modal opens
-  2. Click "摄影图片" → triggers file chooser; select ALL images at once
+  1. Click the submit-content button → modal opens
+  2. Click the photo-type button → triggers file chooser; select ALL images at once
   3. Each image redirects to /draft/detail/{id} in sequence
   4. Fill title (≤50 chars), keywords (5–35), save draft, repeat
 
@@ -38,7 +38,7 @@ def ensure_login(context: BrowserContext) -> None:
 
 
 # Cascader path: [country, state, city] for known locations.
-# Structure observed: 美国 → 加利福尼亚 → {旧金山, 洛杉矶县, 圣地亚哥, 其他}
+# Structure observed: US > California > {San Francisco, Los Angeles County, San Diego, Other}
 _LOCATION_PATHS: list[tuple[list[str], list[str]]] = [
     (["洛杉矶", "LA"],              ["美国", "加利福尼亚", "洛杉矶县"]),
     (["圣地亚哥", "San Diego"],     ["美国", "加利福尼亚", "圣地亚哥"]),
@@ -86,7 +86,7 @@ def _navigate_cascader(page: Page, path: list[str]) -> bool:
 
 
 def _fill_location(page: Page, location_zh: str) -> None:
-    """Navigate the shooting-location cascader. Defaults to 美国/加利福尼亚/其他."""
+    """Navigate the shooting-location cascader. Defaults to US/California/Other."""
     path = _resolve_path(location_zh) if location_zh else _DEFAULT_PATH
     _navigate_cascader(page, path)
 

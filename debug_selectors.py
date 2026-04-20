@@ -18,6 +18,7 @@ PLATFORMS = {
     "px500": "https://creatorstudio.500px.com.cn/index",
     "tuchong": "https://contributor.tuchong.com/contribute?category=0",
     "adobestock": "https://contributor.stock.adobe.com/",
+    "istock": "https://esp.gettyimages.com/",
 }
 
 
@@ -50,6 +51,25 @@ def dump_elements(page):
         data_attrs = {k: el.get_attribute(k) for k in ["data-id", "data-testid", "data-asset-id"] if el.get_attribute(k)}
         if cls or role or data_attrs:
             print(f"  tag={el.evaluate('el=>el.tagName')} role={role!r} class={cls[:80]!r} data={data_attrs}")
+
+    print("\n--- Thumbnail containers (large imgs in left panel) ---")
+    results = page.evaluate("""() => {
+        const thumbs = [...document.querySelectorAll('img')].filter(img => {
+            const r = img.getBoundingClientRect();
+            return r.width >= 60 && r.height >= 60 && r.left < window.innerWidth * 0.6;
+        });
+        return thumbs.map(img => {
+            const p = img.closest('[class]') || img.parentElement;
+            return {
+                imgAlt: img.alt,
+                parentTag: p ? p.tagName : '',
+                parentClass: p ? (p.className || '').slice(0, 120) : '',
+                parentTitle: p ? (p.title || '') : '',
+            };
+        });
+    }""")
+    for r in results:
+        print(f"  <{r['parentTag']} class={r['parentClass']!r} title={r['parentTitle']!r}> img alt={r['imgAlt']!r}")
 
 
 def main():

@@ -1,15 +1,15 @@
 # publish-photos
 
-End-to-end stock photo pipeline: generate bilingual metadata with Claude vision, then upload to Shutterstock, 500px.com.cn, and/or 图虫创意.
+End-to-end stock photo pipeline: generate bilingual metadata with Claude vision, then upload to Shutterstock, 500px.com.cn, Tuchong, and/or Adobe Stock.
 
 ## Usage
 
 ```
-/publish-photos <path> [--platform shutterstock|px500|tuchong|all] [--dry-run]
+/publish-photos <path> [--platform shutterstock|px500|tuchong|adobestock|all] [--dry-run]
 ```
 
 - `<path>` — image file or directory of images
-- `--platform` — target platform (default: `all`); `tuchong` = 图虫创意
+- `--platform` — target platform (default: `all`); `tuchong` = Tuchong
 - `--dry-run` — preview what would run without executing
 
 ## What this skill does
@@ -48,6 +48,15 @@ After the task completes, report:
 - Any `[warn]` or `[fail]` error messages for failed images
 - Remind the user to check the browser if a login prompt appears
 
+Then print the review links for every platform that was uploaded to:
+
+| Platform | Link |
+|---|---|
+| Shutterstock | https://submit.shutterstock.com/catalog |
+| 500px.com.cn | https://creatorstudio.500px.com.cn/index |
+| Tuchong (图虫创意) | https://contributor.tuchong.com/drafts |
+| Adobe Stock | https://contributor.stock.adobe.com/en/uploads |
+
 ## Login (first run)
 
 On the first run for each platform, a browser window opens. Tell the user:
@@ -61,6 +70,7 @@ The session is saved to `.session/` and reused automatically on future runs.
 ```
 /publish-photos ~/Photo/2026-04-15/4
 /publish-photos ~/Photo/2026-04-15/4 --platform shutterstock
+/publish-photos ~/Photo/2026-04-15/4 --platform adobestock
 /publish-photos ~/Photo/2026-04-15/4 --dry-run
 /publish-photos ~/Photo/2026-04-15/4/DSC00012.jpg --platform shutterstock
 ```

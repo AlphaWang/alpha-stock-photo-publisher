@@ -57,7 +57,7 @@ def run_upload(pairs: list[tuple[Path, Path]], platform: str) -> None:
         px_ctx      = get_context("px500", pw)        if platform in ("px500", "all")        else None
         tc_ctx      = get_context("tuchong", pw)      if platform in ("tuchong", "all")      else None
         adobe_ctx   = get_context("adobestock", pw)   if platform in ("adobestock", "all")   else None
-        istock_ctx  = get_context("istock", pw)       if platform in ("istock", "all")       else None
+        istock_ctx  = get_context("istock", pw)       if platform == "istock"                else None
 
         try:
             # Shutterstock: batch upload all images in one file-chooser call

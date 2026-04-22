@@ -44,6 +44,32 @@ def load_metadata(json_path: Path) -> dict:
     return json.loads(json_path.read_text(encoding="utf-8"))
 
 
+# Max images per single upload session per platform (platform UI limits)
+_BATCH_LIMIT = {
+    "shutterstock": 100,
+    "px500":        100,
+    "tuchong":      100,
+    "adobestock":    50,
+    "istock":        50,
+}
+
+
+def _chunked(lst, size):
+    for i in range(0, len(lst), size):
+        yield lst[i : i + size]
+
+
+def _run_platform_batch(loaded, batch_fn, limit, label):
+    """Call batch_fn in chunks of `limit`, return merged results dict."""
+    merged = {}
+    chunks = list(_chunked(loaded, limit))
+    for idx, chunk in enumerate(chunks, 1):
+        if len(chunks) > 1:
+            print(f"  [{label}] batch {idx}/{len(chunks)} ({len(chunk)} images)", flush=True)
+        merged.update(batch_fn(chunk))
+    return merged
+
+
 def run_upload(pairs: list[tuple[Path, Path]], platform: str) -> None:
     from playwright.sync_api import sync_playwright
     import upload.px500 as _px500
@@ -64,7 +90,7 @@ def run_upload(pairs: list[tuple[Path, Path]], platform: str) -> None:
             if ss_ctx:
                 from upload.shutterstock import upload_batch as ss_batch
                 loaded = [(img, load_metadata(jf)) for img, jf in pairs]
-                batch_results = ss_batch(loaded, ss_ctx)
+                batch_results = _run_platform_batch(loaded, lambda c: ss_batch(c, ss_ctx), _BATCH_LIMIT["shutterstock"], "shutterstock")
                 for ok in batch_results.values():
                     results["ok" if ok else "fail"] += 1
 
@@ -72,7 +98,7 @@ def run_upload(pairs: list[tuple[Path, Path]], platform: str) -> None:
             if px_ctx:
                 _px500.ensure_login(px_ctx)
                 loaded = [(img, load_metadata(jf)) for img, jf in pairs]
-                batch_results = _px500.upload_batch(loaded, px_ctx)
+                batch_results = _run_platform_batch(loaded, lambda c: _px500.upload_batch(c, px_ctx), _BATCH_LIMIT["px500"], "px500")
                 for ok in batch_results.values():
                     results["ok" if ok else "fail"] += 1
 
@@ -81,7 +107,7 @@ def run_upload(pairs: list[tuple[Path, Path]], platform: str) -> None:
                 import upload.tuchong as _tuchong
                 _tuchong.ensure_login(tc_ctx)
                 loaded = [(img, load_metadata(jf)) for img, jf in pairs]
-                batch_results = _tuchong.upload_batch(loaded, tc_ctx)
+                batch_results = _run_platform_batch(loaded, lambda c: _tuchong.upload_batch(c, tc_ctx), _BATCH_LIMIT["tuchong"], "tuchong")
                 for ok in batch_results.values():
                     results["ok" if ok else "fail"] += 1
 
@@ -89,7 +115,7 @@ def run_upload(pairs: list[tuple[Path, Path]], platform: str) -> None:
             if adobe_ctx:
                 from upload.adobestock import upload_batch as adobe_batch
                 loaded = [(img, load_metadata(jf)) for img, jf in pairs]
-                batch_results = adobe_batch(loaded, adobe_ctx)
+                batch_results = _run_platform_batch(loaded, lambda c: adobe_batch(c, adobe_ctx), _BATCH_LIMIT["adobestock"], "adobestock")
                 for ok in batch_results.values():
                     results["ok" if ok else "fail"] += 1
 
@@ -98,7 +124,7 @@ def run_upload(pairs: list[tuple[Path, Path]], platform: str) -> None:
                 import upload.istock as _istock
                 _istock.ensure_login(istock_ctx)
                 loaded = [(img, load_metadata(jf)) for img, jf in pairs]
-                batch_results = _istock.upload_batch(loaded, istock_ctx)
+                batch_results = _run_platform_batch(loaded, lambda c: _istock.upload_batch(c, istock_ctx), _BATCH_LIMIT["istock"], "istock")
                 for ok in batch_results.values():
                     results["ok" if ok else "fail"] += 1
         finally:

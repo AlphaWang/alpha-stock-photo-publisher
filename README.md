@@ -41,6 +41,8 @@ Open this project in [Claude Code](https://claude.ai/code) and run:
 ```
 /publish-photos /path/to/dir
 /publish-photos /path/to/dir --platform shutterstock
+/publish-photos /path/to/dir --platform px500
+/publish-photos /path/to/dir --platform tuchong
 /publish-photos /path/to/dir --platform adobestock
 /publish-photos /path/to/dir --dry-run
 ```

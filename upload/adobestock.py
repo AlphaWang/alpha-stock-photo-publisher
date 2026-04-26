@@ -87,9 +87,22 @@ def _navigate_to_uploads(page: Page) -> None:
     uploads_url = f"{parsed.scheme}://{parsed.netloc}/{locale}/uploads"
     page.goto(uploads_url, wait_until="domcontentloaded", timeout=20_000)
 
-    # Click Upload button to open the modal (exposes the hidden file input)
+    # Click Upload button to open the modal (exposes the hidden file input).
+    # Adobe Spectrum adds is-disabled class while previous uploads are still processing.
+    # Poll for up to 3 min, then try anyway (click will fail gracefully if still disabled).
     upload_btn = page.locator("button:has-text('Upload')").first
     upload_btn.wait_for(state="visible", timeout=30_000)
+    for _ in range(60):
+        cls = upload_btn.get_attribute("class") or ""
+        if "is-disabled" not in cls:
+            break
+        page.wait_for_timeout(3_000)
+    else:
+        print(
+            "  [warn] Upload button still disabled after 3 min — "
+            "clear pending drafts at https://contributor.stock.adobe.com/en/uploads",
+            flush=True,
+        )
     upload_btn.click()
     page.wait_for_timeout(1_000)
 
@@ -232,7 +245,7 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
         expected = pre_count + len(pairs)
         page.wait_for_function(
             f"() => document.querySelectorAll(\"{_TILE_SEL}\").length >= {expected}",
-            timeout=300_000,
+            timeout=600_000,
         )
         page.wait_for_timeout(2_000)
 

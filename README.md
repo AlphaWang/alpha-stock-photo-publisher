@@ -97,6 +97,32 @@ If you run metadata generation on the same image twice, the newest JSON is used 
 | Keywords | exactly 50 | exactly 35 | 15–49 (ordered by relevance) | ≤ 50 |
 | Categories | 1 required + 1 optional | — | 1 required (from 16 fixed options) | 1 required |
 
+## Tuchong draft cleanup
+
+Use `cleanup_tuchong_drafts.py` to bulk-delete draft folders left behind from failed or unwanted uploads.
+
+**Preview (no deletions, lists up to 50 by default)**
+
+```bash
+python3 cleanup_tuchong_drafts.py
+python3 cleanup_tuchong_drafts.py --preview-limit 100
+```
+
+**Actually delete**
+
+```bash
+# Delete all draft folders
+python3 cleanup_tuchong_drafts.py --execute --all
+
+# Delete only the first 20 draft folders
+python3 cleanup_tuchong_drafts.py --execute --limit 20
+
+# Skip the confirmation prompt (for scripting)
+python3 cleanup_tuchong_drafts.py --execute --all --yes
+```
+
+The script reuses the `.session/tuchong` browser session. On the first run it will open a browser window for login, the same as the upload flow.
+
 ## Supported image formats
 
 `.jpg` `.jpeg` `.png` `.gif` `.webp`
@@ -112,7 +138,8 @@ upload/
   px500.py             # 500px.com.cn upload automation
   tuchong.py           # Tuchong upload automation
   adobestock.py        # Adobe Stock upload automation
-debug_selectors.py     # interactive DOM inspector for debugging selectors
+cleanup_tuchong_drafts.py  # bulk-delete Tuchong draft folders
+debug_selectors.py         # interactive DOM inspector for debugging selectors
 .claude/skills/
   publish-photos/
     SKILL.md           # /publish-photos Claude Code skill

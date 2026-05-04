@@ -39,9 +39,17 @@ def get_context(platform: str, playwright) -> BrowserContext:
 
 def ensure_logged_in(page: Page, is_logged_in: Callable[[], bool], login_url: str) -> None:
     if not is_logged_in():
-        print(f"Browser opened. Please log in at: {login_url}")
-        print("Press Enter here when done...")
+        print(f"Browser opened. Please log in at: {login_url}", flush=True)
         page.goto(login_url)
-        input()
+        try:
+            print("Press Enter here when done...", flush=True)
+            input()
+        except EOFError:
+            # No TTY (background process) — poll until the user logs in via the browser.
+            print("Waiting for login in browser (up to 5 minutes)...", flush=True)
+            for _ in range(60):
+                page.wait_for_timeout(5_000)
+                if is_logged_in():
+                    return
         if not is_logged_in():
-            raise RuntimeError("Login not detected after user confirmation. Aborting.")
+            raise RuntimeError("Login not detected. Please log in and retry.")

@@ -5,8 +5,8 @@ Upload flow (contributor.tuchong.com):
   1. Navigate to the creative-image upload page
   2. Click the add-images button → file chooser; select ALL images at once
   3. Wait for all uploads to complete (no in-progress indicators remaining)
-  4. For each image: click thumbnail → fill right-panel metadata
-  5. Select all → save draft
+  4. For each image: isolate that thumbnail → fill its own JSON metadata
+  5. Save draft once, so the upload batch remains one draft folder
 
 NOTE: Selectors based on contributor.tuchong.com UI as of 2026-04. Update if the site changes.
 """
@@ -42,19 +42,30 @@ _DEFAULT_CATEGORIES = ["自然风光"]
 def _is_logged_in(page: Page) -> bool:
     try:
         page.goto(UPLOAD_URL, wait_until="domcontentloaded", timeout=15_000)
-        # If redirected to login page, we're not logged in
-        return "login" not in page.url and page.url.startswith("https://contributor.tuchong.com")
-    except PWTimeout:
+        if "login" in page.url or not page.url.startswith("https://contributor.tuchong.com"):
+            return False
+        # Tuchong serves the upload URL even when logged out but hides the upload button.
+        page.wait_for_selector("button:has-text('添加图片')", timeout=5_000)
+        return True
+    except Exception:
         return False
 
 
 def ensure_login(context: BrowserContext) -> None:
-    """Check login once before batch upload. Opens a temp page, then closes it."""
-    page = context.new_page()
+    """Check login once before batch upload."""
+    # Poll on a fresh page each time so the login page isn't navigated away from.
+    def poll_logged_in() -> bool:
+        p = context.new_page()
+        try:
+            return _is_logged_in(p)
+        finally:
+            p.close()
+
+    login_page = context.new_page()
     try:
-        ensure_logged_in(page, lambda: _is_logged_in(page), LOGIN_URL)
+        ensure_logged_in(login_page, poll_logged_in, LOGIN_URL)
     finally:
-        page.close()
+        login_page.close()
 
 
 def _resolve_categories(category1: str) -> list[str]:
@@ -66,7 +77,7 @@ def _resolve_categories(category1: str) -> list[str]:
 
 
 def _fill_metadata(page: Page, metadata: dict) -> None:
-    """Fill right-panel metadata for the currently-selected image."""
+    """Fill right-panel metadata for the currently-selected image(s)."""
     # Scope all lookups to the sider form to avoid stray element matches
     form = page.locator("form.contribute__sider-form")
     try:
@@ -86,6 +97,13 @@ def _fill_metadata(page: Page, metadata: dict) -> None:
     # Image category — <input class="ant-input" placeholder="请选择"> opens a modal
     cats = _resolve_categories(metadata.get("category1", ""))
     try:
+        page.wait_for_function(
+            "() => {"
+            "  const el = document.querySelector(\"form.contribute__sider-form input.ant-input[placeholder='请选择']\");"
+            "  return el && !el.disabled && !el.classList.contains('ant-input-disabled');"
+            "}",
+            timeout=30_000,
+        )
         form.locator("input.ant-input[placeholder='请选择']").click(timeout=5_000)
         # Wait for modal to appear AND let its CSS animation finish before clicking.
         # The locator resolves as soon as the DOM node exists,
@@ -126,7 +144,7 @@ def _fill_metadata(page: Page, metadata: dict) -> None:
         )
         ta.scroll_into_view_if_needed()
         ta.click()
-        ta.type(desc, delay=20)
+        ta.fill(desc)
         page.wait_for_timeout(200)
     except Exception as e:
         print(f"  [warn] description field failed: {e}")
@@ -149,6 +167,67 @@ def _fill_metadata(page: Page, metadata: dict) -> None:
             print(f"  [warn] keywords field failed: {e}")
 
 
+def _selected_card_count(page: Page) -> int:
+    return page.locator(".contribute__image__item .pop-top .ant-checkbox-wrapper-checked").count()
+
+
+def _deselect_all_cards(page: Page) -> None:
+    """Clear selected thumbnails so metadata edits only affect the active image."""
+    checked = page.locator(".contribute__image__item .pop-top .ant-checkbox-wrapper-checked")
+    while checked.count() > 0:
+        try:
+            checked.first.click(timeout=2_000)
+            page.wait_for_timeout(150)
+        except Exception:
+            break
+
+
+def _select_card_for_edit(page: Page, img: Path, idx: int = 0) -> None:
+    """Select exactly one thumbnail and open its side-panel metadata form."""
+    _deselect_all_cards(page)
+    page.wait_for_timeout(200)
+
+    # Try full filename first; Tuchong may truncate long names in the UI,
+    # so fall back to stem (no extension), then by position.
+    for locator in [
+        page.locator(".contribute__image__item").filter(has=page.locator(f"text={img.name}")).first,
+        page.locator(".contribute__image__item").filter(has=page.locator(f"text={img.stem}")).first,
+        page.locator(".contribute__image__item").nth(idx),
+    ]:
+        if locator.count() > 0:
+            card = locator
+            break
+    else:
+        card = page.locator(".contribute__image__item").nth(idx)
+
+    card.wait_for(state="attached", timeout=30_000)
+    card.scroll_into_view_if_needed()
+    card.wait_for(state="visible", timeout=10_000)
+    card.click()
+    page.wait_for_timeout(800)
+
+
+def _select_all_for_save(page: Page, expected: int) -> None:
+    """Select the batch for the final save without changing any metadata fields."""
+    if expected <= 0 or _selected_card_count(page) >= expected:
+        return
+
+    try:
+        all_chk = page.locator("label:has-text('全选') input[type='checkbox']").first
+        if all_chk.count() > 0 and not all_chk.is_checked():
+            all_chk.check(force=True)
+            page.wait_for_timeout(500)
+            return
+    except Exception:
+        pass
+
+    try:
+        page.locator("text=全选").first.click(timeout=5_000)
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+
 def _check_pledge(page: Page) -> None:
     """Tick the pledge/agreement checkbox before submitting."""
     try:
@@ -166,19 +245,36 @@ def _check_pledge(page: Page) -> None:
 
 
 def _wait_for_uploads(page: Page, count: int) -> None:
-    """Wait for a batch of uploads to complete (appear then disappear)."""
+    """Wait for all upload cards to finish (no per-card uploading indicator)."""
     try:
-        page.wait_for_function(
-            "() => document.body.innerText.includes('上传中')",
-            timeout=30_000,
-        )
+        page.wait_for_selector(".contribute__image__item", timeout=30_000)
     except PWTimeout:
-        pass  # upload completed before we could detect it starting
-    timeout = max(600_000, count * 5 * 60 * 1000)
-    page.wait_for_function(
-        "() => !document.body.innerText.includes('上传中')",
-        timeout=timeout,
-    )
+        return
+
+    deadline_ms = max(180_000, count * 2 * 60 * 1000)
+    elapsed_ms = 0
+    check_ms = 10_000
+    while elapsed_ms < deadline_ms:
+        statuses = page.evaluate(
+            """() => [...document.querySelectorAll(
+                '.contribute__image__item .upload-process-each__text'
+            )].map(el => el.textContent.trim())"""
+        )
+        # Only wait for files actively mid-transfer (X% < 100).
+        # '上传中 100%' = fully transferred; '等待上传中' = queued but not started.
+        # Both are treated as "done enough to proceed" — _card_error handles the rest.
+        in_progress = sum(
+            1 for s in statuses
+            if '上传中' in s and '100%' not in s and '等待上传中' not in s
+        )
+        if in_progress == 0:
+            break
+        status_summary = ", ".join(dict.fromkeys(statuses))
+        print(f"  [wait] {in_progress}/{count} mid-transfer: {status_summary}", flush=True)
+        page.wait_for_timeout(check_ms)
+        elapsed_ms += check_ms
+    else:
+        print(f"  [warn] upload wait timed out after {deadline_ms // 1000}s", flush=True)
     page.wait_for_timeout(2_000)
 
 
@@ -192,7 +288,11 @@ def _card_error(page: Page, filename: str) -> str | None:
             const el = card.querySelector('.upload-process-each__text');
             if (!el) return null;
             const text = el.textContent.trim();
-            return text.includes('上传中') ? null : text;
+            // File is still queued (never started uploading) — treat as not uploaded
+            if (text.includes('等待上传中')) return '等待上传中';
+            // File is actively uploading or fully transferred — no error
+            if (text.includes('上传中')) return null;
+            return text;
         }""",
         filename,
     )
@@ -215,6 +315,12 @@ def _delete_card(page: Page, filename: str) -> None:
 
 def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dict[str, bool]:
     """Upload all images, fill metadata per image, then submit."""
+    # Close any stale pages that Chrome restored from a previous crashed session.
+    for stale in list(context.pages):
+        try:
+            stale.close()
+        except Exception:
+            pass
     page = context.new_page()
     results = {img.name: False for img, _ in pairs}
     total = len(pairs)
@@ -229,6 +335,19 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
                 if attempt == 2:
                     raise
                 page.wait_for_timeout(2_000)
+
+        # Clear localStorage and unregister service workers to flush any upload
+        # queue state left by previous crashed sessions. Login lives in cookies,
+        # so this is safe.
+        page.evaluate("""() => {
+            try { localStorage.clear(); } catch(e) {}
+            if (navigator.serviceWorker) {
+                navigator.serviceWorker.getRegistrations().then(regs =>
+                    regs.forEach(r => r.unregister())
+                );
+            }
+        }""")
+        page.reload(wait_until="domcontentloaded", timeout=20_000)
 
         # --- Upload phase with Network Error retry (up to 3 rounds) ---
         to_upload = list(pairs)
@@ -270,45 +389,23 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
             print(f"  [fail] {img.name}: Network Error after 3 attempts", flush=True)
 
         # --- Metadata fill phase ---
-        # Cards are looked up by filename, not by index, because deletions and
-        # retries may change card order on the page.
+        # Each image has its own JSON metadata. Never edit metadata while the
+        # whole batch is selected, because Tuchong applies changed fields to
+        # every selected file.
         for fill_idx, (img, metadata) in enumerate(ok_pairs):
-            # Deselect all selected cards so this card is edited in isolation.
-            # page.evaluate(el.click()) does NOT fire mousedown/mouseup, which Ant
-            # Design's checkbox relies on — use Playwright's locator.click() instead,
-            # which sends the full mouse event sequence React expects.
-            checked = page.locator(
-                ".contribute__image__item .pop-top .ant-checkbox-wrapper-checked"
-            )
-            while checked.count() > 0:
-                try:
-                    checked.first.click(timeout=2_000)
-                    page.wait_for_timeout(150)
-                except Exception:
-                    break
-            page.wait_for_timeout(200)
-
-            card = (
-                page.locator(".contribute__image__item")
-                .filter(has=page.locator(f"text={img.name}"))
-                .first
-            )
             try:
-                card.wait_for(state="visible", timeout=30_000)
-                card.scroll_into_view_if_needed()
-                card.click()
-                page.wait_for_timeout(800)
+                _select_card_for_edit(page, img, fill_idx)
             except PWTimeout:
                 print(f"  [warn] could not locate card for {img.name}")
+                continue
 
-            # Wait until React removes the disabled attribute from the form fields
             try:
                 page.wait_for_function(
                     "() => {"
                     "  const ta = document.querySelector('form.contribute__sider-form textarea.ant-input');"
                     "  return ta && !ta.disabled && !ta.classList.contains('ant-input-disabled');"
                     "}",
-                    timeout=20_000,
+                    timeout=120_000,
                 )
             except PWTimeout:
                 print(f"  [warn] form still disabled for {img.name}")
@@ -316,26 +413,20 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
 
             _fill_metadata(page, metadata)
             print(f"  [{fill_idx + 1}/{len(ok_pairs)}] ✓ {img.name}", flush=True)
-            results[img.name] = True
 
-        # After all images are filled, select all and save draft once.
-        # Each card's metadata is already in React state from the individual fills;
-        # saving with all selected persists all of them in one shot.
-        _check_pledge(page)
-        try:
-            all_chk = page.locator("label:has-text('全选') input[type='checkbox']").first
-            if all_chk.count() > 0 and not all_chk.is_checked():
-                all_chk.check()
-            else:
-                page.locator("text=全选").first.click()
-            page.wait_for_timeout(500)
-        except Exception:
-            pass
-        try:
-            page.locator("button:has-text('保存草稿')").first.click(timeout=5_000)
-            page.wait_for_timeout(2_000)
-        except PWTimeout:
-            print("  [warn] save-draft failed")
+        if ok_pairs:
+            _check_pledge(page)
+            try:
+                # Save once at the end. Selecting the batch here is only for the
+                # save action; no metadata fields are modified after this point.
+                _select_all_for_save(page, len(ok_pairs))
+                page.locator("button:has-text('保存草稿')").first.click(timeout=5_000)
+                page.wait_for_timeout(2_000)
+                for img, _ in ok_pairs:
+                    results[img.name] = True
+                print(f"  Saved Tuchong draft once for {len(ok_pairs)} image(s)", flush=True)
+            except PWTimeout:
+                print("  [warn] save-draft failed")
 
     except Exception as e:
         step = f"at image {fill_idx + 1}" if fill_idx >= 0 else "before fill loop"

@@ -56,7 +56,7 @@ Your goal is to generate titles, descriptions, and keywords that attract buyers 
 
 Platform limits (strictly enforced):
 - description_en (Shutterstock): max {SHUTTERSTOCK_DESC_MAX} characters
-- description_zh (500px.com.cn): max {PX500_DESC_MAX} characters, keep concise
+- description_zh (500px.com.cn): max {PX500_DESC_MAX} characters; aim for 35–50 characters — describe subject, scene, location, lighting, and mood to maximise search coverage and buyer appeal
 - keywords_en (Shutterstock): exactly {SHUTTERSTOCK_KW_MAX}, all lowercase
 - keywords_zh (500px.com.cn): exactly {PX500_KW_MAX}
 

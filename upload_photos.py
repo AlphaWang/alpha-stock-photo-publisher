@@ -10,11 +10,14 @@ Usage:
 """
 
 import argparse
+from datetime import datetime, timezone
+import hashlib
 import json
 import sys
 from pathlib import Path
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+HISTORY_FILENAME = ".stock_upload_history.json"
 
 
 def find_pairs(directory: Path) -> list[tuple[Path, Path]]:
@@ -44,6 +47,38 @@ def load_metadata(json_path: Path) -> dict:
     return json.loads(json_path.read_text(encoding="utf-8"))
 
 
+def _load_history(directory: Path) -> dict:
+    path = directory / HISTORY_FILENAME
+    if not path.exists():
+        return {"version": 1, "uploads": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data.get("uploads"), dict):
+            raise ValueError("missing uploads object")
+        return data
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        print(f"  [warn] Ignoring invalid upload history: {e}", flush=True)
+        return {"version": 1, "uploads": {}}
+
+
+def _save_history(directory: Path, history: dict) -> None:
+    path = directory / HISTORY_FILENAME
+    temp_path = path.with_suffix(".tmp")
+    temp_path.write_text(
+        json.dumps(history, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temp_path.replace(path)
+
+
+def _image_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as image_file:
+        for chunk in iter(lambda: image_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 # Max images per single upload session per platform (platform UI limits)
 _BATCH_LIMIT = {
     "shutterstock": 100,
@@ -51,6 +86,15 @@ _BATCH_LIMIT = {
     "tuchong":      100,
     "adobestock":    50,
     "istock":        50,
+}
+
+_STABLE_PLATFORMS = ("shutterstock", "px500", "tuchong", "adobestock")
+_PLATFORM_LABELS = {
+    "shutterstock": "Shutterstock",
+    "px500": "500px/VCG",
+    "tuchong": "Tuchong",
+    "adobestock": "Adobe Stock",
+    "istock": "Getty/iStock",
 }
 
 
@@ -70,63 +114,113 @@ def _run_platform_batch(loaded, batch_fn, limit, label):
     return merged
 
 
-def run_upload(pairs: list[tuple[Path, Path]], platform: str) -> None:
+def _result_counts(batch_results: dict[str, bool]) -> tuple[int, int]:
+    ok = sum(1 for value in batch_results.values() if value)
+    return ok, len(batch_results) - ok
+
+
+def _platform_enabled(requested: str, target: str) -> bool:
+    return requested == target or (requested == "all" and target in _STABLE_PLATFORMS)
+
+
+def run_upload(pairs: list[tuple[Path, Path]], platform: str, *, force: bool = False) -> None:
     from playwright.sync_api import sync_playwright
     import upload.px500 as _px500
     from upload.browser import get_context
 
-    total = len(pairs)
-    results = {"ok": 0, "fail": 0}
+    results_by_platform: dict[str, dict[str, bool]] = {}
+    skipped_by_platform: dict[str, int] = {}
+    history_directory = pairs[0][0].parent
+    history = _load_history(history_directory)
+    digests = {img.name: _image_digest(img) for img, _ in pairs}
+
+    def prepare(platform_key: str) -> list[tuple[Path, dict]]:
+        completed = history["uploads"].get(platform_key, {})
+        loaded = []
+        skipped = 0
+        for img, json_path in pairs:
+            if not force and digests[img.name] in completed:
+                skipped += 1
+                continue
+            loaded.append((img, load_metadata(json_path)))
+        skipped_by_platform[platform_key] = skipped
+        if skipped:
+            print(f"  [{platform_key}] skipped {skipped} previously completed image(s)", flush=True)
+        return loaded
+
+    def record(platform_key: str, batch_results: dict[str, bool]) -> None:
+        completed = history["uploads"].setdefault(platform_key, {})
+        changed = False
+        for filename, ok in batch_results.items():
+            if not ok:
+                continue
+            completed[digests[filename]] = {
+                "filename": filename,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            changed = True
+        if changed:
+            try:
+                _save_history(history_directory, history)
+            except OSError as e:
+                print(f"  [warn] Could not save upload history: {e}", flush=True)
+
+    selected_keys = [
+        key for key in _PLATFORM_LABELS if _platform_enabled(platform, key)
+    ]
+    prepared = {key: prepare(key) for key in selected_keys}
+    for key in selected_keys:
+        results_by_platform[_PLATFORM_LABELS[key]] = {}
 
     with sync_playwright() as pw:
-        ss_ctx      = get_context("shutterstock", pw) if platform in ("shutterstock", "all") else None
-        px_ctx      = get_context("px500", pw)        if platform in ("px500", "all")        else None
-        tc_ctx      = get_context("tuchong", pw)      if platform in ("tuchong", "all")      else None
-        adobe_ctx   = get_context("adobestock", pw)   if platform in ("adobestock", "all")   else None
-        istock_ctx  = get_context("istock", pw)       if platform == "istock"                else None
+        ss_ctx = get_context("shutterstock", pw) if prepared.get("shutterstock") else None
+        px_ctx = get_context("px500", pw) if prepared.get("px500") else None
+        tc_ctx = get_context("tuchong", pw) if prepared.get("tuchong") else None
+        adobe_ctx = get_context("adobestock", pw) if prepared.get("adobestock") else None
+        istock_ctx = get_context("istock", pw) if prepared.get("istock") else None
 
         try:
             # Shutterstock: batch upload all images in one file-chooser call
             if ss_ctx:
                 from upload.shutterstock import upload_batch as ss_batch
-                loaded = [(img, load_metadata(jf)) for img, jf in pairs]
+                loaded = prepared["shutterstock"]
                 batch_results = _run_platform_batch(loaded, lambda c: ss_batch(c, ss_ctx), _BATCH_LIMIT["shutterstock"], "shutterstock")
-                for ok in batch_results.values():
-                    results["ok" if ok else "fail"] += 1
+                results_by_platform["Shutterstock"] = batch_results
+                record("shutterstock", batch_results)
 
             # 500px: batch — select all files at once, fill metadata per draft page
             if px_ctx:
                 _px500.ensure_login(px_ctx)
-                loaded = [(img, load_metadata(jf)) for img, jf in pairs]
+                loaded = prepared["px500"]
                 batch_results = _run_platform_batch(loaded, lambda c: _px500.upload_batch(c, px_ctx), _BATCH_LIMIT["px500"], "px500")
-                for ok in batch_results.values():
-                    results["ok" if ok else "fail"] += 1
+                results_by_platform["500px/VCG"] = batch_results
+                record("px500", batch_results)
 
             # Tuchong: batch — upload all, fill metadata per image, then submit
             if tc_ctx:
                 import upload.tuchong as _tuchong
                 _tuchong.ensure_login(tc_ctx)
-                loaded = [(img, load_metadata(jf)) for img, jf in pairs]
+                loaded = prepared["tuchong"]
                 batch_results = _run_platform_batch(loaded, lambda c: _tuchong.upload_batch(c, tc_ctx), _BATCH_LIMIT["tuchong"], "tuchong")
-                for ok in batch_results.values():
-                    results["ok" if ok else "fail"] += 1
+                results_by_platform["Tuchong"] = batch_results
+                record("tuchong", batch_results)
 
             # Adobe Stock: batch — upload all, fill metadata tile by tile, then submit
             if adobe_ctx:
                 from upload.adobestock import upload_batch as adobe_batch
-                loaded = [(img, load_metadata(jf)) for img, jf in pairs]
+                loaded = prepared["adobestock"]
                 batch_results = _run_platform_batch(loaded, lambda c: adobe_batch(c, adobe_ctx), _BATCH_LIMIT["adobestock"], "adobestock")
-                for ok in batch_results.values():
-                    results["ok" if ok else "fail"] += 1
+                results_by_platform["Adobe Stock"] = batch_results
+                record("adobestock", batch_results)
 
             # iStock / Getty Images: batch — upload all, fill metadata per image, then submit
             if istock_ctx:
                 import upload.istock as _istock
                 _istock.ensure_login(istock_ctx)
-                loaded = [(img, load_metadata(jf)) for img, jf in pairs]
+                loaded = prepared["istock"]
                 batch_results = _run_platform_batch(loaded, lambda c: _istock.upload_batch(c, istock_ctx), _BATCH_LIMIT["istock"], "istock")
-                for ok in batch_results.values():
-                    results["ok" if ok else "fail"] += 1
+                results_by_platform["Getty/iStock"] = batch_results
+                record("istock", batch_results)
         finally:
             if ss_ctx:
                 ss_ctx.close()
@@ -139,9 +233,17 @@ def run_upload(pairs: list[tuple[Path, Path]], platform: str) -> None:
             if istock_ctx:
                 istock_ctx.close()
 
-    print(f"\nDone: {results['ok']}/{total} succeeded", flush=True)
-    if results["fail"]:
-        print(f"Failed: {results['fail']}", flush=True)
+    print("\nUpload summary:", flush=True)
+    platform_keys = {label: key for key, label in _PLATFORM_LABELS.items()}
+    for label, batch_results in results_by_platform.items():
+        ok, fail = _result_counts(batch_results)
+        suffix = f", {fail} need review or failed" if fail else ""
+        skipped = skipped_by_platform.get(platform_keys[label], 0)
+        skipped_text = f", {skipped} previously completed" if skipped else ""
+        print(
+            f"  {label}: {ok}/{len(batch_results)} completed{suffix}{skipped_text}",
+            flush=True,
+        )
 
 
 def main():
@@ -151,9 +253,13 @@ def main():
         "--platform", "-p",
         choices=["shutterstock", "px500", "tuchong", "adobestock", "istock", "all"],
         default="all",
-        help="Target platform (default: all). istock = Getty Images / iStock",
+        help=(
+            "Target platform (default: all stable platforms). "
+            "istock is experimental and must be selected explicitly"
+        ),
     )
     parser.add_argument("--dry-run", action="store_true", help="List pairs without uploading")
+    parser.add_argument("--force", action="store_true", help="Upload even if history marks the image complete")
     args = parser.parse_args()
 
     target = Path(args.directory).expanduser().resolve()
@@ -180,7 +286,7 @@ def main():
         print("\nDry run — no uploads performed.")
         return
 
-    run_upload(pairs, args.platform)
+    run_upload(pairs, args.platform, force=args.force)
 
 
 if __name__ == "__main__":

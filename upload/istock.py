@@ -14,6 +14,7 @@ NOTE: Selectors based on contributor.gettyimages.com UI as of 2026-04.
       Run `python3 debug_selectors.py istock` to verify/update them if the site changes.
 """
 
+import json
 from pathlib import Path
 
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PWTimeout
@@ -70,6 +71,18 @@ def _resolve_category(category1: str) -> str:
     return _DEFAULT_CATEGORY
 
 
+def _auto_review_reason(metadata: dict) -> str:
+    title = metadata.get("title_en") or metadata.get("description_en", "")
+    if not str(title).strip():
+        return "title is empty"
+    if not metadata.get("keywords_en", [])[:50]:
+        return "keywords are empty"
+    release_notes = str(metadata.get("release_notes", "")).strip()
+    if release_notes:
+        return f"release review required — {release_notes}"
+    return ""
+
+
 def _wait_for_uploads(page: Page, count: int) -> None:
     """Wait for all uploads to finish (progress indicators appear then disappear)."""
     # Wait for upload indicators to appear
@@ -91,10 +104,28 @@ def _wait_for_uploads(page: Page, count: int) -> None:
     page.wait_for_timeout(2_000)
 
 
-def _fill_metadata(page: Page, img: Path, metadata: dict) -> None:
-    """Fill Title and Keywords for the currently-selected image."""
-    # Title — ≤200 chars; prefer description_en (richer), fall back to title_en
-    title = metadata.get("description_en", metadata.get("title_en", ""))[:200]
+def _find_asset_card(page: Page, img: Path):
+    """Return a card only when it can be tied to this filename."""
+    filename = json.dumps(img.name, ensure_ascii=False)
+    stem = json.dumps(img.stem, ensure_ascii=False)
+    return page.locator(
+        f"[data-filename={filename}], [title={filename}], [alt={filename}], "
+        f"[data-testid*='asset']:has-text({stem})"
+    ).first
+
+
+def _fill_metadata(page: Page, img: Path, metadata: dict) -> bool:
+    """Fill required metadata, returning False if any required field fails."""
+    title = (metadata.get("title_en") or metadata.get("description_en", ""))[:200]
+    keywords = metadata.get("keywords_en", [])[:50]
+    release_notes = str(metadata.get("release_notes", "")).strip()
+    if not title or not keywords:
+        print(f"  [review] {img.name}: title or keywords are empty", flush=True)
+        return False
+    if release_notes:
+        print(f"  [review] {img.name}: release review required — {release_notes}", flush=True)
+        return False
+
     try:
         # TODO: verify selector via debug_selectors.py istock
         ta = page.locator("input[name='title'], textarea[name='title'], [data-testid='title-input']").first
@@ -120,40 +151,55 @@ def _fill_metadata(page: Page, img: Path, metadata: dict) -> None:
         page.wait_for_timeout(200)
     except Exception as e:
         print(f"  [warn] title field failed for {img.name}: {e}", flush=True)
+        return False
 
     # Keywords — up to 50, comma-separated
-    keywords = metadata.get("keywords_en", [])[:50]
-    if keywords:
-        try:
-            # TODO: verify selector via debug_selectors.py istock
-            kw_input = page.locator(
-                "input[name='keywords'], [data-testid='keywords-input'], input[placeholder*='keyword' i]"
-            ).first
-            kw_input.wait_for(state="visible", timeout=10_000)
-            kw_input.click()
-            kw_input.fill(", ".join(keywords))
-            kw_input.press("Enter")
-            page.wait_for_timeout(300)
-        except Exception as e:
-            print(f"  [warn] keywords field failed for {img.name}: {e}", flush=True)
+    try:
+        # TODO: verify selector via debug_selectors.py istock
+        kw_input = page.locator(
+            "input[name='keywords'], [data-testid='keywords-input'], input[placeholder*='keyword' i]"
+        ).first
+        kw_input.wait_for(state="visible", timeout=10_000)
+        kw_input.click()
+        kw_input.fill(", ".join(keywords))
+        kw_input.press("Enter")
+        page.wait_for_timeout(300)
+    except Exception as e:
+        print(f"  [warn] keywords field failed for {img.name}: {e}", flush=True)
+        return False
 
     # Category — single select
     category = _resolve_category(metadata.get("category1", ""))
     try:
         # TODO: verify selector via debug_selectors.py istock
         cat_btn = page.locator("[data-testid='category-select'], [aria-label*='category' i]").first
-        if cat_btn.count() > 0:
-            cat_btn.click()
-            page.locator(f"li:has-text('{category}'), option:has-text('{category}')").first.click(timeout=5_000)
-            page.wait_for_timeout(300)
+        if cat_btn.count() == 0:
+            print(f"  [warn] category field not found for {img.name}", flush=True)
+            return False
+        cat_btn.click()
+        page.locator(f"li:has-text('{category}'), option:has-text('{category}')").first.click(timeout=5_000)
+        page.wait_for_timeout(300)
     except Exception as e:
         print(f"  [warn] category field failed for {img.name}: {e}", flush=True)
+        return False
+    return True
 
 
 def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dict[str, bool]:
     """Upload all images, fill metadata per image, then submit the batch."""
-    page = context.new_page()
     results = {img.name: False for img, _ in pairs}
+    eligible_pairs = []
+    for img, metadata in pairs:
+        reason = _auto_review_reason(metadata)
+        if reason:
+            print(f"  [review] Getty/iStock skipped {img.name}: {reason}", flush=True)
+        else:
+            eligible_pairs.append((img, metadata))
+    if not eligible_pairs:
+        return results
+
+    pairs = eligible_pairs
+    page = context.new_page()
     total = len(pairs)
     fill_idx = -1
 
@@ -183,36 +229,45 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
         print(f"  Uploading {total} image(s) to Getty Images / iStock...", flush=True)
         _wait_for_uploads(page, total)
 
-        # Fill metadata per image
+        # Fill metadata per image. Keep results false until batch submission succeeds.
+        ready_names: list[str] = []
         for fill_idx, (img, metadata) in enumerate(pairs):
             # Locate the image card/thumbnail by filename
             # TODO: verify card selector via debug_selectors.py istock
             try:
-                card = page.locator(
-                    f"[data-filename='{img.name}'], [title='{img.name}'], "
-                    f"[alt='{img.name}'], [data-testid*='asset']:has-text('{img.stem}')"
-                ).first
+                card = _find_asset_card(page, img)
                 if card.count() == 0:
-                    card = page.locator(f"text={img.stem}").first
+                    print(f"  [review] could not identify asset card for {img.name}", flush=True)
+                    continue
                 card.scroll_into_view_if_needed()
                 card.click()
                 page.wait_for_timeout(800)
             except Exception as e:
                 print(f"  [warn] could not locate card for {img.name}: {e}", flush=True)
+                continue
 
-            _fill_metadata(page, img, metadata)
-            print(f"  [{fill_idx + 1}/{total}] ✓ {img.name}", flush=True)
-            results[img.name] = True
+            if _fill_metadata(page, img, metadata):
+                ready_names.append(img.name)
+                print(f"  [{fill_idx + 1}/{total}] ready {img.name}", flush=True)
+            else:
+                print(f"  [{fill_idx + 1}/{total}] review required {img.name}", flush=True)
 
         # Submit the batch
         try:
+            if not ready_names:
+                print("  [warn] No Getty/iStock assets were ready to submit", flush=True)
+                return results
             # TODO: verify submit button selector via debug_selectors.py istock
             page.locator(
                 "button:has-text('Submit'), [data-testid='submit-button']"
             ).first.click(timeout=5_000)
             page.wait_for_timeout(2_000)
+            for name in ready_names:
+                results[name] = True
         except PWTimeout:
             print("  [warn] submit button not found — batch may need manual submission", flush=True)
+        except Exception as e:
+            print(f"  [warn] batch submission failed: {e}", flush=True)
 
     except Exception as e:
         step = f"at image {fill_idx + 1}" if fill_idx >= 0 else "before fill loop"

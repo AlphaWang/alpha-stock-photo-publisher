@@ -62,7 +62,15 @@ python3 photo_desc.py /path/to/dir
 
 # Step 2 — upload
 python3 upload_photos.py /path/to/dir --platform shutterstock
+python3 upload_photos.py /path/to/dir --platform shutterstock --force  # intentionally re-upload
 ```
+
+`--platform all` runs the stable platforms. Getty/iStock remains experimental and
+must be selected explicitly with `--platform istock`.
+
+Completed uploads are tracked by image content hash in
+`.stock_upload_history.json` beside the photos. Subsequent runs skip completed
+images for that platform unless `--force` is supplied.
 
 ## First run (browser login)
 
@@ -93,8 +101,8 @@ If you run metadata generation on the same image twice, the newest JSON is used 
 
 | Field | Shutterstock | 500px.com.cn | Adobe Stock | Getty / iStock |
 |---|---|---|---|---|
-| Title / Description | ≤ 2048 chars | ≤ 50 chars | title ≤ 200 chars | title ≤ 200 chars |
-| Keywords | exactly 50 | exactly 35 | 15–49 (ordered by relevance) | ≤ 50 |
+| Title / Description | ≤ 2048 chars | ≤ 50 chars | title ≤ 70 chars | title ≤ 200 chars |
+| Keywords | up to 50, ordered by relevance | up to 35 | up to 49 (first 10 strongest) | ≤ 50 |
 | Categories | 1 required + 1 optional | — | 1 required (from 16 fixed options) | 1 required |
 
 ## Tuchong draft cleanup

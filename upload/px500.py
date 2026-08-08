@@ -11,6 +11,8 @@ NOTE: Selectors based on 500px.com.cn creator studio UI as of 2026-04. Update if
 """
 
 from pathlib import Path
+import json
+from typing import Optional
 
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PWTimeout
 
@@ -46,15 +48,25 @@ _LOCATION_PATHS: list[tuple[list[str], list[str]]] = [
     (["蒙特雷", "Monterey", "卡梅尔"], ["美国", "加利福尼亚", "其他"]),
     (["加利福尼亚", "加州", "California"], ["美国", "加利福尼亚", "其他"]),
 ]
-_DEFAULT_PATH = ["美国", "加利福尼亚", "其他"]
-
-
-def _resolve_path(location_zh: str) -> list[str]:
+def _resolve_path(location_zh: str) -> Optional[list[str]]:
     """Map a free-form location string to a cascader path."""
     for keywords, path in _LOCATION_PATHS:
         if any(kw in location_zh for kw in keywords):
             return path
-    return _DEFAULT_PATH
+    return None
+
+
+def _auto_review_reason(metadata: dict) -> str:
+    title = metadata.get("description_zh") or metadata.get("title_zh", "")
+    if not str(title).strip():
+        return "title is empty"
+    keyword_count = len(metadata.get("keywords_zh", [])[:35])
+    if keyword_count < 5:
+        return f"only {keyword_count} keywords (min 5 required)"
+    location = str(metadata.get("location_zh", "")).strip()
+    if _resolve_path(location) is None:
+        return f"unknown shooting location: {location or '(empty)'}"
+    return ""
 
 
 def _navigate_cascader(page: Page, path: list[str]) -> bool:
@@ -85,30 +97,39 @@ def _navigate_cascader(page: Page, path: list[str]) -> bool:
     return True
 
 
-def _fill_location(page: Page, location_zh: str) -> None:
-    """Navigate the shooting-location cascader. Defaults to US/California/Other."""
-    path = _resolve_path(location_zh) if location_zh else _DEFAULT_PATH
-    _navigate_cascader(page, path)
+def _fill_location(page: Page, location_zh: str) -> bool:
+    """Fill a known shooting location without inventing a fallback location."""
+    path = _resolve_path(location_zh) if location_zh else None
+    return bool(path and _navigate_cascader(page, path))
 
 
-def _fill_metadata(page: Page, metadata: dict) -> None:
-    """Fill draft detail page with metadata for one image."""
+def _fill_metadata(page: Page, metadata: dict) -> bool:
+    """Fill and save one draft, returning False when manual review is required."""
     # Dismiss any info popup
     try:
         page.locator("button:has-text('我知道了')").first.click(timeout=5_000)
     except PWTimeout:
         pass
 
+    title = (metadata.get("description_zh") or metadata.get("title_zh", ""))[:50]
+    keywords = metadata.get("keywords_zh", [])[:35]
+    location = metadata.get("location_zh", "")
+    if not title or len(keywords) < 5:
+        print("  [review] title or required keywords are missing", flush=True)
+        return False
+    if _resolve_path(location) is None:
+        print(f"  [review] unknown shooting location: {location or '(empty)'}", flush=True)
+        return False
+
     # Title
     title_sel = "input[placeholder*='一句话描述'], input.right-form-title"
     page.wait_for_selector(title_sel, timeout=30_000)
-    page.locator(title_sel).first.fill(metadata.get("description_zh", "")[:50])
+    page.locator(title_sel).first.fill(title)
 
     # Keywords — fill input then press Enter to commit all tags at once
     kw_sel = "input[placeholder*='关键词']"
     kw_input = page.locator(kw_sel).first
     if kw_input.count() > 0:
-        keywords = metadata.get("keywords_zh", [])[:35]
         kw_input.fill(",".join(keywords))
         kw_input.press("Enter")
         page.wait_for_timeout(800)
@@ -124,7 +145,9 @@ def _fill_metadata(page: Page, metadata: dict) -> None:
             pass
 
     # Location — required field; try quick buttons then cascader search
-    _fill_location(page, metadata.get("location_zh", ""))
+    if not _fill_location(page, location):
+        print(f"  [review] could not select shooting location: {location}", flush=True)
+        return False
 
     # Accept pledge checkbox if shown
     try:
@@ -137,12 +160,24 @@ def _fill_metadata(page: Page, metadata: dict) -> None:
     # Save as draft
     page.locator("button:has-text('保存草稿')").first.click()
     page.wait_for_timeout(2_000)
+    return True
 
 
 def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dict[str, bool]:
     """Upload all images in one file-chooser call, then fill metadata per draft page."""
-    page = context.new_page()
     results = {img.name: False for img, _ in pairs}
+    eligible_pairs = []
+    for img, metadata in pairs:
+        reason = _auto_review_reason(metadata)
+        if reason:
+            print(f"  [review] 500px skipped {img.name}: {reason}", flush=True)
+        else:
+            eligible_pairs.append((img, metadata))
+    if not eligible_pairs:
+        return results
+
+    pairs = eligible_pairs
+    page = context.new_page()
     total = len(pairs)
 
     try:
@@ -166,8 +201,8 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
 
         # Wait for the batch draft page and all image spans to be in the DOM
         page.wait_for_url("**/draft/detail/**", timeout=120_000)
-        last_img = pairs[-1][0].name
-        page.wait_for_selector(f"span[title='{last_img}']", timeout=60_000)
+        last_img = json.dumps(pairs[-1][0].name, ensure_ascii=False)
+        page.wait_for_selector(f"span[title={last_img}]", timeout=60_000)
 
         print(f"  Uploading {total} images...")
 
@@ -183,11 +218,14 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
 
         i = -1
         for i, (img, metadata) in enumerate(pairs):
-            page.locator(f"span[title='{img.name}']").click()
+            filename = json.dumps(img.name, ensure_ascii=False)
+            page.locator(f"span[title={filename}]").click()
             page.wait_for_timeout(600)
-            _fill_metadata(page, metadata)
-            print(f"  [{i + 1}/{total}] ✓ {img.name}")
-            results[img.name] = True
+            if _fill_metadata(page, metadata):
+                print(f"  [{i + 1}/{total}] saved {img.name}")
+                results[img.name] = True
+            else:
+                print(f"  [{i + 1}/{total}] review required {img.name}")
 
     except Exception as e:
         step = f"at image {i + 1}" if i >= 0 else "before upload loop"

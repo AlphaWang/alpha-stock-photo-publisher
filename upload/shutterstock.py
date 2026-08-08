@@ -16,6 +16,7 @@ Confirmed UI flow (from browser inspection sessions):
 """
 
 from pathlib import Path
+import json
 
 from playwright.sync_api import BrowserContext, TimeoutError as PWTimeout
 
@@ -38,7 +39,8 @@ def _fill_metadata(page, img: Path, meta: dict) -> None:
     # Wait for the panel to show THIS image's title before filling anything.
     # Without this, a React re-render caused by the card transition can clear
     # a description we already filled.
-    page.wait_for_selector(f"h3:has-text('{img.name}')", timeout=20_000)
+    filename = json.dumps(img.name, ensure_ascii=False)
+    page.wait_for_selector(f"h3:has-text({filename})", timeout=20_000)
     page.wait_for_timeout(400)  # let React finish rendering the freshly opened panel
 
     desc_text = meta.get("description_en", "")
@@ -110,7 +112,8 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
         results: dict[str, bool] = {}
         for img, meta in pairs:
             try:
-                card = page.locator(f".MuiCard-root:has-text('{img.name}')").first
+                filename = json.dumps(img.name, ensure_ascii=False)
+                card = page.locator(f".MuiCard-root:has-text({filename})").first
                 card.scroll_into_view_if_needed()
                 bbox = card.bounding_box()
                 page.mouse.click(bbox["x"] + bbox["width"] / 2, bbox["y"] + bbox["height"] * 0.35)

@@ -4,3 +4,4 @@ __pycache__/
 .env
 .claude/settings.local.json
 .idea/
+.stock_upload_history.json

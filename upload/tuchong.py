@@ -76,8 +76,15 @@ def _resolve_categories(category1: str) -> list[str]:
     return _DEFAULT_CATEGORIES
 
 
-def _fill_metadata(page: Page, metadata: dict) -> None:
-    """Fill right-panel metadata for the currently-selected image(s)."""
+def _fill_metadata(page: Page, metadata: dict) -> bool:
+    """Fill required metadata and report whether every required field succeeded."""
+    description = metadata.get("description_zh", "")[:50]
+    keywords = metadata.get("keywords_zh", [])[:30]
+    if not description or not keywords:
+        print("  [review] description or keywords are missing")
+        return False
+
+    complete = True
     # Scope all lookups to the sider form to avoid stray element matches
     form = page.locator("form.contribute__sider-form")
     try:
@@ -110,6 +117,7 @@ def _fill_metadata(page: Page, metadata: dict) -> None:
         # but clicks during the slide-in animation are often dropped by the browser.
         page.wait_for_selector("text=摄影图片类", timeout=10_000)
         page.wait_for_timeout(600)
+        selected_categories = 0
         for cat in cats:
             try:
                 # Scope to [role='dialog'] so we don't hit page elements that
@@ -121,16 +129,20 @@ def _fill_metadata(page: Page, metadata: dict) -> None:
                     else page.locator(f"text={cat}").first
                 )
                 target.click(timeout=5_000)
+                selected_categories += 1
                 page.wait_for_timeout(400)
             except PWTimeout:
                 pass
+        if selected_categories == 0:
+            complete = False
+            print("  [warn] no image category could be selected")
         page.locator("button:has-text('确认'), button:has-text('确 认')").first.click(timeout=5_000)
         page.wait_for_timeout(1_000)  # wait for modal to close fully
     except PWTimeout as e:
         print(f"  [warn] category field failed: {e}")
+        complete = False
 
     # Image description — <textarea class="ant-input contribute-form-model" maxlength="50">
-    desc = metadata.get("description_zh", "")[:50]
     try:
         ta = form.locator("textarea.ant-input").first
         ta.wait_for(state="visible", timeout=10_000)
@@ -144,27 +156,29 @@ def _fill_metadata(page: Page, metadata: dict) -> None:
         )
         ta.scroll_into_view_if_needed()
         ta.click()
-        ta.fill(desc)
+        ta.fill(description)
         page.wait_for_timeout(200)
     except Exception as e:
         print(f"  [warn] description field failed: {e}")
+        complete = False
 
     # Keywords — Ant Design Select (tags/multiple mode)
     # .ant-select-selection--multiple contains a hidden input.ant-select-search__field
-    keywords = metadata.get("keywords_zh", [])[:30]
-    if keywords:
-        try:
-            kw_sel = form.locator(".ant-select-selection--multiple").first
-            kw_sel.scroll_into_view_if_needed()
-            kw_sel.click()
-            page.wait_for_timeout(300)
-            kw_input = kw_sel.locator("input.ant-select-search__field")
-            for kw in keywords:
-                kw_input.type(kw)
-                kw_input.press("Enter")
-                page.wait_for_timeout(80)
-        except Exception as e:
-            print(f"  [warn] keywords field failed: {e}")
+    try:
+        kw_sel = form.locator(".ant-select-selection--multiple").first
+        kw_sel.scroll_into_view_if_needed()
+        kw_sel.click()
+        page.wait_for_timeout(300)
+        kw_input = kw_sel.locator("input.ant-select-search__field")
+        for kw in keywords:
+            kw_input.type(kw)
+            kw_input.press("Enter")
+            page.wait_for_timeout(80)
+    except Exception as e:
+        print(f"  [warn] keywords field failed: {e}")
+        complete = False
+
+    return complete
 
 
 def _selected_card_count(page: Page) -> int:
@@ -190,8 +204,8 @@ def _select_card_for_edit(page: Page, img: Path, idx: int = 0) -> None:
     # Try full filename first; Tuchong may truncate long names in the UI,
     # so fall back to stem (no extension), then by position.
     for locator in [
-        page.locator(".contribute__image__item").filter(has=page.locator(f"text={img.name}")).first,
-        page.locator(".contribute__image__item").filter(has=page.locator(f"text={img.stem}")).first,
+        page.locator(".contribute__image__item").filter(has=page.get_by_text(img.name, exact=False)).first,
+        page.locator(".contribute__image__item").filter(has=page.get_by_text(img.stem, exact=False)).first,
         page.locator(".contribute__image__item").nth(idx),
     ]:
         if locator.count() > 0:
@@ -392,6 +406,7 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
         # Each image has its own JSON metadata. Never edit metadata while the
         # whole batch is selected, because Tuchong applies changed fields to
         # every selected file.
+        metadata_ready: set[str] = set()
         for fill_idx, (img, metadata) in enumerate(ok_pairs):
             try:
                 _select_card_for_edit(page, img, fill_idx)
@@ -411,8 +426,11 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
                 print(f"  [warn] form still disabled for {img.name}")
             page.wait_for_timeout(300)
 
-            _fill_metadata(page, metadata)
-            print(f"  [{fill_idx + 1}/{len(ok_pairs)}] ✓ {img.name}", flush=True)
+            if _fill_metadata(page, metadata):
+                metadata_ready.add(img.name)
+                print(f"  [{fill_idx + 1}/{len(ok_pairs)}] ready {img.name}", flush=True)
+            else:
+                print(f"  [{fill_idx + 1}/{len(ok_pairs)}] review required {img.name}", flush=True)
 
         if ok_pairs:
             _check_pledge(page)
@@ -423,7 +441,7 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
                 page.locator("button:has-text('保存草稿')").first.click(timeout=5_000)
                 page.wait_for_timeout(2_000)
                 for img, _ in ok_pairs:
-                    results[img.name] = True
+                    results[img.name] = img.name in metadata_ready
                 print(f"  Saved Tuchong draft once for {len(ok_pairs)} image(s)", flush=True)
             except PWTimeout:
                 print("  [warn] save-draft failed")

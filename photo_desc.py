@@ -36,11 +36,15 @@ MEDIA_TYPES = {
     ".webp": "image/webp",
 }
 
-# Per-platform hard limits enforced both in the prompt and in enforce_limits().
+# Per-platform limits and commercial-quality targets enforced both in the
+# prompt and in enforce_limits().
+TITLE_EN_MAX = 70          # Adobe SEO recommendation; also works well as a buyer-facing title.
+TITLE_ZH_MAX = 50
 SHUTTERSTOCK_DESC_MAX = 2048
 SHUTTERSTOCK_KW_MAX = 50
 PX500_DESC_MAX = 50       # characters
 PX500_KW_MAX = 35
+ADOBE_KW_MAX = 49
 
 SHUTTERSTOCK_CATEGORIES = [
     "Abstract", "Animals/Wildlife", "Arts", "Backgrounds/Textures",
@@ -51,14 +55,25 @@ SHUTTERSTOCK_CATEGORIES = [
     "Sports/Recreation", "Technology", "Transportation", "Vintage",
 ]
 
-SYSTEM_PROMPT = f"""You are a professional stock photo editor specializing in optimizing image metadata for platforms like Shutterstock and 500px.
-Your goal is to generate titles, descriptions, and keywords that attract buyers through search and drive purchases.
+SYSTEM_PROMPT = f"""You are a senior stock photo editor and commercial keywording specialist.
+Your job is to create metadata that helps real stock-image buyers find, trust, and license the image on platforms such as Shutterstock, Adobe Stock, 500px.com.cn/VCG, and Tuchong.
+
+Optimize for commercial usefulness:
+- Be visually accurate first. Never invent objects, locations, species, demographics, landmarks, brands, events, or people that are not visible or supplied in context.
+- Think like a buyer: include subject, action, setting, season/time, mood, composition/viewpoint, color, use case, and commercially useful concepts when they are genuinely supported by the image.
+- Put the most important search terms first. The first 10 English keywords should carry the core subject and buyer intent.
+- Prefer specific terms over vague filler. Avoid keyword stuffing, repeated word stems, near-duplicates, camera/gear terms, file info, links, emojis, and unrelated trend words.
+- Avoid trademarks, brand/product names, artist names, fictional characters, and private personal information for commercial submissions. If a visible logo, recognizable private property, or recognizable person may need review/release, mention it only in release_notes, not as a keyword.
+- Use caring, neutral, respectful language for people and identity-related descriptions. Do not infer sensitive identity traits unless clearly visible or supplied by context.
 
 Platform limits (strictly enforced):
-- description_en (Shutterstock): max {SHUTTERSTOCK_DESC_MAX} characters
-- description_zh (500px.com.cn): max {PX500_DESC_MAX} characters; aim for 35–50 characters — describe subject, scene, location, lighting, and mood to maximise search coverage and buyer appeal
-- keywords_en (Shutterstock): exactly {SHUTTERSTOCK_KW_MAX}, all lowercase
+- title_en (Adobe Stock): max {TITLE_EN_MAX} characters, natural phrase, not a keyword list
+- title_zh: max {TITLE_ZH_MAX} characters
+- description_en (Shutterstock): complete English descriptive sentence, at least 5 words, max {SHUTTERSTOCK_DESC_MAX} characters
+- description_zh (500px.com.cn/Tuchong): max {PX500_DESC_MAX} characters; aim for 35–50 Chinese characters describing subject, scene, location, light, and mood
+- keywords_en: 35–{SHUTTERSTOCK_KW_MAX} relevant English keywords when possible; fewer is acceptable if the image is simple, but never pad with irrelevant terms. All lowercase.
 - keywords_zh (500px.com.cn): exactly {PX500_KW_MAX}
+- Adobe Stock will use the first {ADOBE_KW_MAX} English keywords, so keep the first 10 especially strong and keep the whole list clean.
 
 Arrange keywords from most to least important, covering subject/color/mood/scene/style/use-case dimensions.
 
@@ -67,8 +82,8 @@ Shutterstock categories (category1 required, category2 optional) must be chosen 
 
 Output must be strict JSON with no markdown code fences:
 {{
-  "title_en": "English title",
-  "title_zh": "Chinese title",
+  "title_en": "English title (max {TITLE_EN_MAX} chars)",
+  "title_zh": "Chinese title (max {TITLE_ZH_MAX} chars)",
   "description_en": "Shutterstock description (max {SHUTTERSTOCK_DESC_MAX} chars)",
   "description_zh": "500px Chinese description (max {PX500_DESC_MAX} chars)",
   "keywords_en": ["keyword1", ..., "keyword{SHUTTERSTOCK_KW_MAX}"],
@@ -76,7 +91,9 @@ Output must be strict JSON with no markdown code fences:
   "category1": "Primary Shutterstock category (required)",
   "category2": "Secondary Shutterstock category (optional, omit if not applicable)",
   "location_zh": "Shooting location in Chinese, city-level preferred (e.g. 旧金山, 洛杉矶, 纽约). Infer from context or visual cues; omit field if truly unknown.",
-  "core_keywords_zh": ["most objective keyword 1", "...", "up to 5 total — pick from keywords_zh, most objective subject terms first"]
+  "core_keywords_zh": ["most objective keyword 1", "...", "up to 5 total — pick from keywords_zh, most objective subject terms first"],
+  "commercial_uses_en": ["up to 5 realistic buyer use cases, e.g. travel marketing, wellness blog, real estate"],
+  "release_notes": "Short note if recognizable people/property/logos/IP may require release or cleanup; otherwise empty string"
 }}"""
 
 
@@ -159,7 +176,7 @@ def analyze_image(image_path: Path, client: anthropic.Anthropic, context: str = 
                         "text": (
                             "Analyze this image and generate stock photo metadata optimized for commercial sales. "
                             "Return strict JSON only — no extra text, no markdown code fences. "
-                            f"keywords_en: exactly {SHUTTERSTOCK_KW_MAX}, all lowercase. "
+                            f"keywords_en: up to {SHUTTERSTOCK_KW_MAX}, all lowercase, ordered by relevance, no filler. "
                             f"keywords_zh: exactly {PX500_KW_MAX} Chinese keywords. "
                             f"description_zh: max {PX500_DESC_MAX} characters."
                             + context_note
@@ -177,12 +194,77 @@ def analyze_image(image_path: Path, client: anthropic.Anthropic, context: str = 
     return json.loads(raw)
 
 
+def _clean_text(value: object) -> str:
+    """Normalize whitespace without changing the model's wording."""
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _trim_text(value: object, limit: int) -> str:
+    text = _clean_text(value)
+    if len(text) <= limit:
+        return text
+
+    trimmed = text[:limit].rstrip()
+    if " " in trimmed and len(text) > limit:
+        trimmed = trimmed.rsplit(" ", 1)[0].rstrip(" ,.;:")
+    return trimmed or text[:limit].rstrip()
+
+
+def _normalize_keywords(values: object, *, limit: int, lowercase: bool = False) -> list[str]:
+    """Clean and de-duplicate keywords while preserving relevance order."""
+    if not isinstance(values, list):
+        return []
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        kw = _clean_text(value).strip(" ,;，、。.;:")
+        if not kw:
+            continue
+        if lowercase:
+            kw = kw.lower()
+        key = kw.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(kw)
+        if len(cleaned) >= limit:
+            break
+    return cleaned
+
+
 def enforce_limits(result: dict) -> dict:
-    """Hard-truncate fields to platform limits as a safety net after the API call."""
-    result["description_en"] = result.get("description_en", "")[:SHUTTERSTOCK_DESC_MAX]
-    result["description_zh"] = result.get("description_zh", "")[:PX500_DESC_MAX]
-    result["keywords_en"] = result.get("keywords_en", [])[:SHUTTERSTOCK_KW_MAX]
-    result["keywords_zh"] = result.get("keywords_zh", [])[:PX500_KW_MAX]
+    """Apply platform limits and metadata hygiene after the API call."""
+    result["title_en"] = _trim_text(result.get("title_en", ""), TITLE_EN_MAX)
+    result["title_zh"] = _trim_text(result.get("title_zh", ""), TITLE_ZH_MAX)
+    result["description_en"] = _trim_text(result.get("description_en", ""), SHUTTERSTOCK_DESC_MAX)
+    result["description_zh"] = _trim_text(result.get("description_zh", ""), PX500_DESC_MAX)
+    result["keywords_en"] = _normalize_keywords(
+        result.get("keywords_en", []),
+        limit=SHUTTERSTOCK_KW_MAX,
+        lowercase=True,
+    )
+    result["keywords_zh"] = _normalize_keywords(
+        result.get("keywords_zh", []),
+        limit=PX500_KW_MAX,
+    )
+    result["core_keywords_zh"] = _normalize_keywords(
+        result.get("core_keywords_zh", []),
+        limit=5,
+    )
+    if not result["core_keywords_zh"]:
+        result["core_keywords_zh"] = result["keywords_zh"][:5]
+
+    category1 = _clean_text(result.get("category1", ""))
+    category2 = _clean_text(result.get("category2", ""))
+    result["category1"] = category1 if category1 in SHUTTERSTOCK_CATEGORIES else "Miscellaneous"
+    result["category2"] = category2 if category2 in SHUTTERSTOCK_CATEGORIES else ""
+    result["location_zh"] = _trim_text(result.get("location_zh", ""), 80)
+    result["commercial_uses_en"] = _normalize_keywords(
+        result.get("commercial_uses_en", []),
+        limit=5,
+    )
+    result["release_notes"] = _trim_text(result.get("release_notes", ""), 240)
     return result
 
 

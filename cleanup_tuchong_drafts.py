@@ -15,21 +15,14 @@ Delete only the first 20 draft folders:
 import argparse
 import sys
 from dataclasses import dataclass
+from typing import Optional
 
 from playwright.sync_api import Page, sync_playwright
 
-from upload.browser import SESSION_DIR
+from upload.browser import get_context
 from upload.tuchong import ensure_login
 
 DRAFTS_URL = "https://contributor.tuchong.com/mine?status=draft&source="
-
-_STEALTH_SCRIPT = """
-Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
-Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en-US', 'en']});
-window.chrome = {runtime: {}};
-"""
-
 
 @dataclass
 class DraftCard:
@@ -55,19 +48,9 @@ def _read_cards(page: Page) -> list[DraftCard]:
 
 
 def _get_context(playwright, use_system_chrome: bool):
-    user_data = SESSION_DIR / "tuchong"
-    user_data.mkdir(parents=True, exist_ok=True)
-    ctx = playwright.chromium.launch_persistent_context(
-        str(user_data),
-        channel="chrome",
-        headless=False,
-        slow_mo=80,
-        viewport={"width": 1280, "height": 900},
-        args=["--disable-blink-features=AutomationControlled"],
-        ignore_default_args=["--enable-automation"],
+    return get_context(
+        "tuchong", playwright, prefer_system_chrome=use_system_chrome
     )
-    ctx.add_init_script(_STEALTH_SCRIPT)
-    return ctx
 
 
 def _goto_drafts(page: Page, url: str) -> None:
@@ -103,13 +86,16 @@ def _confirm_delete(page: Page) -> None:
 
 
 def _delete_card(page: Page, card: DraftCard) -> bool:
-    if not card.asset_id and not card.upload_time:
-        print("  [warn] card has no identifiers, skipping", flush=True)
+    if not card.asset_id:
+        print("  [warn] card has no stable asset ID, skipping", flush=True)
         return False
 
     card_loc = page.locator(f"li.contribute__item:has(span.type-id:text-is('{card.asset_id}'))")
-    if card_loc.count() == 0:
-        print("  [warn] card not found in DOM", flush=True)
+    if card_loc.count() != 1:
+        print(
+            f"  [warn] expected one card for id={card.asset_id}, found {card_loc.count()}; skipping",
+            flush=True,
+        )
         return False
 
     card_loc.locator("div.contribute__item-img").hover()
@@ -164,7 +150,7 @@ def preview(page: Page, scan_limit: int) -> int:
     return len(seen)
 
 
-def delete_drafts(page: Page, limit: int | None) -> int:
+def delete_drafts(page: Page, limit: Optional[int]) -> int:
     deleted = 0
     stable_scrolls = 0
 

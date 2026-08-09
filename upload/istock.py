@@ -8,7 +8,7 @@ Upload flow (contributor.gettyimages.com):
   2. Click the "Add files" button → file chooser; select ALL images at once
   3. Wait for all uploads to complete
   4. For each image: click thumbnail → fill Title and Keywords in the side panel
-  5. Submit the batch
+  5. Leave prepared assets for contributor review; automatic submission is disabled
 
 NOTE: Selectors based on contributor.gettyimages.com UI as of 2026-04.
       Run `python3 debug_selectors.py istock` to verify/update them if the site changes.
@@ -16,10 +16,12 @@ NOTE: Selectors based on contributor.gettyimages.com UI as of 2026-04.
 
 import json
 from pathlib import Path
+from typing import Optional
 
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PWTimeout
 
 from .browser import ensure_logged_in
+from .status import UploadStatus
 
 LOGIN_URL  = "https://esp.gettyimages.com/"
 UPLOAD_URL = "https://esp.gettyimages.com/"
@@ -40,17 +42,19 @@ _CATEGORY_MAP: dict[str, str] = {
     "Business":     "Business",
     "People":       "People",
 }
-_DEFAULT_CATEGORY = "Nature"
+def _has_logged_in_session(page: Page) -> bool:
+    url = page.url.lower()
+    return (
+        url.startswith("https://esp.gettyimages.com")
+        and "login" not in url
+        and "signin" not in url
+    )
 
 
 def _is_logged_in(page: Page) -> bool:
     try:
         page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=15_000)
-        return (
-            page.url.startswith("https://esp.gettyimages.com")
-            and "login" not in page.url.lower()
-            and "signin" not in page.url.lower()
-        )
+        return _has_logged_in_session(page)
     except PWTimeout:
         return False
 
@@ -59,16 +63,21 @@ def ensure_login(context: BrowserContext) -> None:
     """Check login once before batch upload. Opens a temp page, then closes it."""
     page = context.new_page()
     try:
-        ensure_logged_in(page, lambda: _is_logged_in(page), LOGIN_URL)
+        ensure_logged_in(
+            page,
+            lambda: _is_logged_in(page),
+            LOGIN_URL,
+            poll_logged_in=lambda: _has_logged_in_session(page),
+        )
     finally:
         page.close()
 
 
-def _resolve_category(category1: str) -> str:
+def _resolve_category(category1: str) -> Optional[str]:
     for key, cat in _CATEGORY_MAP.items():
         if key.lower() in category1.lower():
             return cat
-    return _DEFAULT_CATEGORY
+    return None
 
 
 def _auto_review_reason(metadata: dict) -> str:
@@ -78,8 +87,13 @@ def _auto_review_reason(metadata: dict) -> str:
     if not metadata.get("keywords_en", [])[:50]:
         return "keywords are empty"
     release_notes = str(metadata.get("release_notes", "")).strip()
+    release_status = str(metadata.get("release_status", "unknown")).strip().lower()
+    if release_status != "clear":
+        return f"release status is {release_status or 'unknown'}"
     if release_notes:
         return f"release review required — {release_notes}"
+    if _resolve_category(str(metadata.get("category1", ""))) is None:
+        return "category cannot be mapped to Getty/iStock"
     return ""
 
 
@@ -119,8 +133,12 @@ def _fill_metadata(page: Page, img: Path, metadata: dict) -> bool:
     title = (metadata.get("title_en") or metadata.get("description_en", ""))[:200]
     keywords = metadata.get("keywords_en", [])[:50]
     release_notes = str(metadata.get("release_notes", "")).strip()
+    release_status = str(metadata.get("release_status", "unknown")).strip().lower()
     if not title or not keywords:
         print(f"  [review] {img.name}: title or keywords are empty", flush=True)
+        return False
+    if release_status != "clear":
+        print(f"  [review] {img.name}: release status is {release_status or 'unknown'}", flush=True)
         return False
     if release_notes:
         print(f"  [review] {img.name}: release review required — {release_notes}", flush=True)
@@ -170,6 +188,9 @@ def _fill_metadata(page: Page, img: Path, metadata: dict) -> bool:
 
     # Category — single select
     category = _resolve_category(metadata.get("category1", ""))
+    if category is None:
+        print(f"  [review] category cannot be mapped for {img.name}", flush=True)
+        return False
     try:
         # TODO: verify selector via debug_selectors.py istock
         cat_btn = page.locator("[data-testid='category-select'], [aria-label*='category' i]").first
@@ -185,14 +206,15 @@ def _fill_metadata(page: Page, img: Path, metadata: dict) -> bool:
     return True
 
 
-def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dict[str, bool]:
+def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dict[str, UploadStatus]:
     """Upload all images, fill metadata per image, then submit the batch."""
-    results = {img.name: False for img, _ in pairs}
+    results = {img.name: UploadStatus.FAILED for img, _ in pairs}
     eligible_pairs = []
     for img, metadata in pairs:
         reason = _auto_review_reason(metadata)
         if reason:
             print(f"  [review] Getty/iStock skipped {img.name}: {reason}", flush=True)
+            results[img.name] = UploadStatus.NEEDS_REVIEW
         else:
             eligible_pairs.append((img, metadata))
     if not eligible_pairs:
@@ -228,8 +250,7 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
 
         print(f"  Uploading {total} image(s) to Getty Images / iStock...", flush=True)
         _wait_for_uploads(page, total)
-
-        # Fill metadata per image. Keep results false until batch submission succeeds.
+        # Fill metadata only after tying a visible asset card to the exact filename.
         ready_names: list[str] = []
         for fill_idx, (img, metadata) in enumerate(pairs):
             # Locate the image card/thumbnail by filename
@@ -238,12 +259,15 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
                 card = _find_asset_card(page, img)
                 if card.count() == 0:
                     print(f"  [review] could not identify asset card for {img.name}", flush=True)
+                    results[img.name] = UploadStatus.NEEDS_REVIEW
                     continue
                 card.scroll_into_view_if_needed()
                 card.click()
                 page.wait_for_timeout(800)
+                results[img.name] = UploadStatus.UPLOADED
             except Exception as e:
                 print(f"  [warn] could not locate card for {img.name}: {e}", flush=True)
+                results[img.name] = UploadStatus.NEEDS_REVIEW
                 continue
 
             if _fill_metadata(page, img, metadata):
@@ -252,22 +276,13 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
             else:
                 print(f"  [{fill_idx + 1}/{total}] review required {img.name}", flush=True)
 
-        # Submit the batch
-        try:
-            if not ready_names:
-                print("  [warn] No Getty/iStock assets were ready to submit", flush=True)
-                return results
-            # TODO: verify submit button selector via debug_selectors.py istock
-            page.locator(
-                "button:has-text('Submit'), [data-testid='submit-button']"
-            ).first.click(timeout=5_000)
-            page.wait_for_timeout(2_000)
-            for name in ready_names:
-                results[name] = True
-        except PWTimeout:
-            print("  [warn] submit button not found — batch may need manual submission", flush=True)
-        except Exception as e:
-            print(f"  [warn] batch submission failed: {e}", flush=True)
+        # Selectors and submission scope remain experimental. Preserve prepared
+        # work as a draft and require contributor review instead of auto-submit.
+        if ready_names:
+            print(
+                "  [review] Getty/iStock metadata prepared; automatic submission is disabled",
+                flush=True,
+            )
 
     except Exception as e:
         step = f"at image {fill_idx + 1}" if fill_idx >= 0 else "before fill loop"
@@ -281,4 +296,4 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
 def upload(image_path: Path, metadata: dict, context: BrowserContext) -> bool:
     """Single-image upload. Delegates to upload_batch."""
     results = upload_batch([(image_path, metadata)], context)
-    return results.get(image_path.name, False)
+    return results.get(image_path.name, UploadStatus.FAILED).completed

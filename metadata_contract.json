@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "StockPhotoMetadata",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "title_en",
+    "title_zh",
+    "description_en",
+    "description_zh",
+    "keywords_en",
+    "keywords_zh",
+    "category1",
+    "category2",
+    "location_zh",
+    "core_keywords_zh",
+    "commercial_uses_en",
+    "release_status",
+    "release_notes"
+  ],
+  "properties": {
+    "title_en": {"type": "string", "minLength": 1, "maxLength": 70},
+    "title_zh": {"type": "string", "minLength": 1, "maxLength": 50},
+    "description_en": {"type": "string", "minLength": 5, "maxLength": 2048},
+    "description_zh": {"type": "string", "minLength": 1, "maxLength": 50},
+    "keywords_en": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 50,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "keywords_zh": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 35,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "category1": {
+      "enum": [
+        "Abstract", "Animals/Wildlife", "Arts", "Backgrounds/Textures",
+        "Beauty/Fashion", "Buildings/Landmarks", "Business/Finance", "Celebrities",
+        "Education", "Food and drink", "Healthcare/Medical", "Holidays",
+        "Industrial", "Interiors", "Miscellaneous", "Nature", "Objects",
+        "Parks/Outdoor", "People", "Religion", "Science", "Signs/Symbols",
+        "Sports/Recreation", "Technology", "Transportation", "Vintage"
+      ]
+    },
+    "category2": {
+      "enum": [
+        "", "Abstract", "Animals/Wildlife", "Arts", "Backgrounds/Textures",
+        "Beauty/Fashion", "Buildings/Landmarks", "Business/Finance", "Celebrities",
+        "Education", "Food and drink", "Healthcare/Medical", "Holidays",
+        "Industrial", "Interiors", "Miscellaneous", "Nature", "Objects",
+        "Parks/Outdoor", "People", "Religion", "Science", "Signs/Symbols",
+        "Sports/Recreation", "Technology", "Transportation", "Vintage"
+      ]
+    },
+    "location_zh": {"type": "string", "maxLength": 80},
+    "core_keywords_zh": {
+      "type": "array",
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "commercial_uses_en": {
+      "type": "array",
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "release_status": {"enum": ["clear", "required", "unknown"]},
+    "release_notes": {"type": "string", "maxLength": 240}
+  }
+}

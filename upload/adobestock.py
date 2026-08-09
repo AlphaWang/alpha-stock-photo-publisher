@@ -16,10 +16,13 @@ Adobe uses the Spectrum design system; category picker is a custom FieldButton, 
 
 from pathlib import Path
 import re
+from typing import Optional
 
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PWTimeout
 
 from .browser import ensure_logged_in
+from .confirmation import wait_for_success_text
+from .status import UploadStatus
 
 PORTAL_URL = "https://contributor.stock.adobe.com/"
 LOGIN_URL = PORTAL_URL
@@ -54,14 +57,11 @@ _CATEGORY_MAP: dict[str, str] = {
     "Travel":               "Travel",
     "Vintage":              "Lifestyle",
 }
-_DEFAULT_CATEGORY = "The Environment"
-
-
-def _resolve_category(category1: str) -> str:
+def _resolve_category(category1: str) -> Optional[str]:
     for key, val in _CATEGORY_MAP.items():
         if key.lower() in category1.lower():
             return val
-    return _DEFAULT_CATEGORY
+    return None
 
 
 def _auto_review_reason(meta: dict) -> str:
@@ -71,9 +71,19 @@ def _auto_review_reason(meta: dict) -> str:
     if keyword_count < 5:
         return f"only {keyword_count} keywords (min 5 required)"
     release_notes = str(meta.get("release_notes", "")).strip()
+    release_status = str(meta.get("release_status", "unknown")).strip().lower()
+    if release_status != "clear":
+        return f"release status is {release_status or 'unknown'}"
     if release_notes:
         return f"release review required — {release_notes}"
+    if _resolve_category(str(meta.get("category1", ""))) is None:
+        return "category cannot be mapped to Adobe Stock"
     return ""
+
+
+def _has_logged_in_session(page: Page) -> bool:
+    url = page.url.lower()
+    return "contributor.stock.adobe.com" in url and "login" not in url
 
 
 def _is_logged_in(page: Page) -> bool:
@@ -81,7 +91,7 @@ def _is_logged_in(page: Page) -> bool:
         page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=20_000)
         if "login" in page.url or "account.adobe.com" in page.url:
             return False
-        return "contributor.stock.adobe.com" in page.url
+        return _has_logged_in_session(page)
     except PWTimeout:
         return False
 
@@ -165,11 +175,15 @@ def _fill_metadata(page: Page, img: Path, meta: dict) -> bool:
     title = meta.get("title_en", "")[:200]
     keywords = meta.get("keywords_en", [])[:49]
     release_notes = str(meta.get("release_notes", "")).strip()
+    release_status = str(meta.get("release_status", "unknown")).strip().lower()
     if not title:
         print(f"  [review] {img.name}: title is empty")
         return False
     if len(keywords) < 5:
         print(f"  [review] {img.name}: only {len(keywords)} keywords (min 5 required)")
+        return False
+    if release_status != "clear":
+        print(f"  [review] {img.name}: release status is {release_status or 'unknown'}")
         return False
     if release_notes:
         print(f"  [review] {img.name}: release review required — {release_notes}")
@@ -221,6 +235,9 @@ def _fill_metadata(page: Page, img: Path, meta: dict) -> bool:
 
     # Category — try hidden native <select> first (force), fall back to Spectrum FieldButton
     category = _resolve_category(meta.get("category1", ""))
+    if category is None:
+        print(f"  [review] {img.name}: category cannot be mapped to Adobe Stock")
+        return False
     try:
         cat_select = page.locator("select[name='category']").first
         if cat_select.count() > 0:
@@ -246,21 +263,21 @@ def _fill_metadata(page: Page, img: Path, meta: dict) -> bool:
             timeout=15_000,
         )
         page.locator("[data-t='save-work']").first.click()
-        page.wait_for_timeout(2_000)
-        return True
+        return wait_for_success_text(page, ["saved", "work saved", "已保存"])
     except PWTimeout:
         print(f"  [warn] {img.name}: Save work still disabled — check required fields")
         return False
 
 
-def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dict[str, bool]:
+def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dict[str, UploadStatus]:
     """Upload all images via the hidden file input, then fill metadata tile by tile."""
-    results = {img.name: False for img, _ in pairs}
+    results = {img.name: UploadStatus.FAILED for img, _ in pairs}
     eligible_pairs = []
     for img, meta in pairs:
         reason = _auto_review_reason(meta)
         if reason:
             print(f"  [review] Adobe skipped {img.name}: {reason}", flush=True)
+            results[img.name] = UploadStatus.NEEDS_REVIEW
         else:
             eligible_pairs.append((img, meta))
     if not eligible_pairs:
@@ -270,7 +287,12 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
     page = context.new_page()
 
     try:
-        ensure_logged_in(page, lambda: _is_logged_in(page), LOGIN_URL)
+        ensure_logged_in(
+            page,
+            lambda: _is_logged_in(page),
+            LOGIN_URL,
+            poll_logged_in=lambda: _has_logged_in_session(page),
+        )
         _navigate_to_uploads(page)
 
         pre_count = _count_tiles(page)
@@ -291,6 +313,8 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
             timeout=600_000,
         )
         page.wait_for_timeout(2_000)
+        for img, _ in pairs:
+            results[img.name] = UploadStatus.UPLOADED
 
         # Build filename→tile-index mapping (tile order may differ from upload order)
         tile_map = _build_tile_map(page, pre_count, expected)
@@ -313,20 +337,35 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
             except Exception as e:
                 print(f"  [{count + 1}/{len(pairs)}] ✗ {img.name} — {e}", flush=True)
 
-        # Submit all tiles (button is disabled until at least one file is saved)
+        # A global submit action may include pre-existing drafts. Leave this batch
+        # saved for review unless the uploads page was empty before this run.
         try:
             if not saved_names:
                 print("  [warn] No Adobe assets were ready to submit", flush=True)
+                return results
+            if pre_count > 0:
+                for name in saved_names:
+                    results[name] = UploadStatus.DRAFT_SAVED
+                print(
+                    "  [review] Adobe had pre-existing drafts; new work was saved but not submitted",
+                    flush=True,
+                )
                 return results
             page.wait_for_function(
                 "() => { const b = document.querySelector('[data-t=\"submit-moderation-button\"]'); return b && !b.disabled; }",
                 timeout=10_000,
             )
             page.locator("button[data-t='submit-moderation-button']").first.click()
-            page.wait_for_timeout(3_000)
-            for name in saved_names:
-                results[name] = True
-            print("  Submitted to Adobe Stock moderation.", flush=True)
+            if wait_for_success_text(
+                page, ["submitted", "submission successful", "已提交"]
+            ):
+                for name in saved_names:
+                    results[name] = UploadStatus.SUBMITTED
+                print("  Submitted to Adobe Stock moderation.", flush=True)
+            else:
+                for name in saved_names:
+                    results[name] = UploadStatus.DRAFT_SAVED
+                print("  [review] Adobe submission was not confirmed; work remains saved", flush=True)
         except PWTimeout:
             print("  [warn] Submit button still disabled — check that at least one file was saved", flush=True)
         except Exception as e:
@@ -342,4 +381,6 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
 
 def upload(image_path: Path, metadata: dict, context: BrowserContext) -> bool:
     """Single-image upload. Delegates to upload_batch."""
-    return upload_batch([(image_path, metadata)], context).get(image_path.name, False)
+    return upload_batch([(image_path, metadata)], context).get(
+        image_path.name, UploadStatus.FAILED
+    ).completed

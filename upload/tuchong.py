@@ -12,10 +12,13 @@ NOTE: Selectors based on contributor.tuchong.com UI as of 2026-04. Update if the
 """
 
 from pathlib import Path
+from typing import Optional
 
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PWTimeout
 
 from .browser import ensure_logged_in
+from .confirmation import wait_for_success_text
+from .status import UploadStatus
 
 LOGIN_URL  = "https://contributor.tuchong.com/"
 UPLOAD_URL = "https://contributor.tuchong.com/contribute?category=0"
@@ -36,9 +39,6 @@ _CATEGORY_MAP: dict[str, list[str]] = {
     "Business":     ["商务肖像"],
     "People":       ["商务肖像"],
 }
-_DEFAULT_CATEGORIES = ["自然风光"]
-
-
 def _is_logged_in(page: Page) -> bool:
     try:
         page.goto(UPLOAD_URL, wait_until="domcontentloaded", timeout=15_000)
@@ -73,7 +73,7 @@ def _resolve_categories(category1: str) -> list[str]:
     for key, tags in _CATEGORY_MAP.items():
         if key.lower() in category1.lower():
             return tags[:2]
-    return _DEFAULT_CATEGORIES
+    return []
 
 
 def _fill_metadata(page: Page, metadata: dict) -> bool:
@@ -292,7 +292,7 @@ def _wait_for_uploads(page: Page, count: int) -> None:
     page.wait_for_timeout(2_000)
 
 
-def _card_error(page: Page, filename: str) -> str | None:
+def _card_error(page: Page, filename: str) -> Optional[str]:
     """Return the error text on a card, or None if the upload succeeded."""
     return page.evaluate(
         """(filename) => {
@@ -327,7 +327,7 @@ def _delete_card(page: Page, filename: str) -> None:
     page.wait_for_timeout(300)
 
 
-def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dict[str, bool]:
+def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dict[str, UploadStatus]:
     """Upload all images, fill metadata per image, then submit."""
     # Close any stale pages that Chrome restored from a previous crashed session.
     for stale in list(context.pages):
@@ -336,7 +336,7 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
         except Exception:
             pass
     page = context.new_page()
-    results = {img.name: False for img, _ in pairs}
+    results = {img.name: UploadStatus.FAILED for img, _ in pairs}
     total = len(pairs)
     fill_idx = -1  # track progress for error reporting in outer except
 
@@ -402,6 +402,9 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
         for img, _ in to_upload:
             print(f"  [fail] {img.name}: Network Error after 3 attempts", flush=True)
 
+        for img, _ in ok_pairs:
+            results[img.name] = UploadStatus.UPLOADED
+
         # --- Metadata fill phase ---
         # Each image has its own JSON metadata. Never edit metadata while the
         # whole batch is selected, because Tuchong applies changed fields to
@@ -439,10 +442,16 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
                 # save action; no metadata fields are modified after this point.
                 _select_all_for_save(page, len(ok_pairs))
                 page.locator("button:has-text('保存草稿')").first.click(timeout=5_000)
-                page.wait_for_timeout(2_000)
-                for img, _ in ok_pairs:
-                    results[img.name] = img.name in metadata_ready
-                print(f"  Saved Tuchong draft once for {len(ok_pairs)} image(s)", flush=True)
+                if wait_for_success_text(page, ["保存成功", "草稿已保存", "操作成功"]):
+                    for img, _ in ok_pairs:
+                        results[img.name] = (
+                            UploadStatus.DRAFT_SAVED
+                            if img.name in metadata_ready
+                            else UploadStatus.UPLOADED
+                        )
+                    print(f"  Saved Tuchong draft once for {len(ok_pairs)} image(s)", flush=True)
+                else:
+                    print("  [warn] Tuchong save was not confirmed", flush=True)
             except PWTimeout:
                 print("  [warn] save-draft failed")
 
@@ -458,4 +467,4 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
 def upload(image_path: Path, metadata: dict, context: BrowserContext) -> bool:
     """Upload a single image. Delegates to upload_batch."""
     results = upload_batch([(image_path, metadata)], context)
-    return results.get(image_path.name, False)
+    return results.get(image_path.name, UploadStatus.FAILED).completed

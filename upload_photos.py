@@ -11,36 +11,45 @@ Usage:
 
 import argparse
 from datetime import datetime, timezone
-import hashlib
 import json
 import sys
 from pathlib import Path
+
+from metadata_core import image_sha256
+from upload.status import UploadStatus
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 HISTORY_FILENAME = ".stock_upload_history.json"
 
 
 def find_pairs(directory: Path) -> list[tuple[Path, Path]]:
-    """Return (image_path, json_path) pairs. For duplicate JSONs, pick the newest."""
-    pairs = []
-    images = {p.stem: p for p in directory.iterdir() if p.suffix.lower() in SUPPORTED_EXTS}
-
-    json_by_stem: dict[str, list[Path]] = {}
-    for jf in directory.glob("*_????????_??????.json"):
-        # filename pattern: {stem}_{YYYYMMDD}_{HHMMSS}.json
-        # strip the _YYYYMMDD_HHMMSS suffix to recover original stem
-        parts = jf.stem.rsplit("_", 2)
-        if len(parts) == 3:
-            orig_stem = parts[0]
-            json_by_stem.setdefault(orig_stem, []).append(jf)
-
-    for stem, jfiles in json_by_stem.items():
-        if stem not in images:
+    """Return exact image/metadata pairs, choosing the newest JSON per source file."""
+    images = {
+        path.name: path
+        for path in directory.iterdir()
+        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTS
+    }
+    json_by_source: dict[str, list[tuple[Path, dict]]] = {}
+    for json_path in directory.glob("*.json"):
+        try:
+            metadata = load_metadata(json_path)
+        except (OSError, ValueError, json.JSONDecodeError):
             continue
-        newest_json = max(jfiles, key=lambda p: p.stat().st_mtime)
-        pairs.append((images[stem], newest_json))
+        source = metadata.get("source")
+        if isinstance(source, str) and source in images:
+            json_by_source.setdefault(source, []).append((json_path, metadata))
 
-    return sorted(pairs, key=lambda t: t[0].name)
+    pairs = []
+    for source, candidates in json_by_source.items():
+        newest_json, _ = max(
+            candidates,
+            key=lambda item: (
+                str(item[1].get("generated_at", "")),
+                item[0].stat().st_mtime,
+            ),
+        )
+        pairs.append((images[source], newest_json))
+    return sorted(pairs, key=lambda pair: pair[0].name)
 
 
 def load_metadata(json_path: Path) -> dict:
@@ -72,11 +81,31 @@ def _save_history(directory: Path, history: dict) -> None:
 
 
 def _image_digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as image_file:
-        for chunk in iter(lambda: image_file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return image_sha256(path)
+
+
+def _validate_metadata_binding(image: Path, metadata: dict, allow_unbound: bool) -> None:
+    if image.stat().st_size <= 0:
+        raise ValueError("image file is empty")
+    try:
+        from PIL import Image
+        with Image.open(image) as opened:
+            opened.verify()
+    except ImportError:
+        pass
+    except Exception as error:
+        raise ValueError(f"image cannot be decoded: {error}")
+    source = metadata.get("source")
+    if source != image.name:
+        raise ValueError(f"metadata source is {source!r}, expected {image.name!r}")
+    expected_digest = metadata.get("source_sha256")
+    if not expected_digest:
+        if allow_unbound:
+            return
+        raise ValueError("metadata has no source_sha256; regenerate it or use --allow-unbound-metadata")
+    actual_digest = _image_digest(image)
+    if expected_digest != actual_digest:
+        raise ValueError("image content changed after metadata generation")
 
 
 # Max images per single upload session per platform (platform UI limits)
@@ -114,8 +143,11 @@ def _run_platform_batch(loaded, batch_fn, limit, label):
     return merged
 
 
-def _result_counts(batch_results: dict[str, bool]) -> tuple[int, int]:
-    ok = sum(1 for value in batch_results.values() if value)
+def _result_counts(batch_results) -> tuple[int, int]:
+    def completed(value):
+        return value.completed if isinstance(value, UploadStatus) else bool(value)
+
+    ok = sum(1 for value in batch_results.values() if completed(value))
     return ok, len(batch_results) - ok
 
 
@@ -123,13 +155,20 @@ def _platform_enabled(requested: str, target: str) -> bool:
     return requested == target or (requested == "all" and target in _STABLE_PLATFORMS)
 
 
-def run_upload(pairs: list[tuple[Path, Path]], platform: str, *, force: bool = False) -> None:
+def run_upload(
+    pairs: list[tuple[Path, Path]],
+    platform: str,
+    *,
+    force: bool = False,
+    allow_unbound_metadata: bool = False,
+) -> bool:
     from playwright.sync_api import sync_playwright
     import upload.px500 as _px500
     from upload.browser import get_context
 
-    results_by_platform: dict[str, dict[str, bool]] = {}
+    results_by_platform: dict[str, dict[str, UploadStatus]] = {}
     skipped_by_platform: dict[str, int] = {}
+    preflight_by_platform: dict[str, dict[str, UploadStatus]] = {}
     history_directory = pairs[0][0].parent
     history = _load_history(history_directory)
     digests = {img.name: _image_digest(img) for img, _ in pairs}
@@ -138,25 +177,34 @@ def run_upload(pairs: list[tuple[Path, Path]], platform: str, *, force: bool = F
         completed = history["uploads"].get(platform_key, {})
         loaded = []
         skipped = 0
+        preflight_results = {}
         for img, json_path in pairs:
             if not force and digests[img.name] in completed:
                 skipped += 1
                 continue
-            loaded.append((img, load_metadata(json_path)))
+            try:
+                metadata = load_metadata(json_path)
+                _validate_metadata_binding(img, metadata, allow_unbound_metadata)
+                loaded.append((img, metadata))
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                print(f"  [review] {img.name}: {error}", flush=True)
+                preflight_results[img.name] = UploadStatus.NEEDS_REVIEW
         skipped_by_platform[platform_key] = skipped
+        preflight_by_platform[platform_key] = preflight_results
         if skipped:
             print(f"  [{platform_key}] skipped {skipped} previously completed image(s)", flush=True)
         return loaded
 
-    def record(platform_key: str, batch_results: dict[str, bool]) -> None:
+    def record(platform_key: str, batch_results: dict[str, UploadStatus]) -> None:
         completed = history["uploads"].setdefault(platform_key, {})
         changed = False
-        for filename, ok in batch_results.items():
-            if not ok:
+        for filename, status in batch_results.items():
+            if not status.recordable:
                 continue
             completed[digests[filename]] = {
                 "filename": filename,
                 "completed_at": datetime.now(timezone.utc).isoformat(),
+                "status": status.value,
             }
             changed = True
         if changed:
@@ -170,83 +218,80 @@ def run_upload(pairs: list[tuple[Path, Path]], platform: str, *, force: bool = F
     ]
     prepared = {key: prepare(key) for key in selected_keys}
     for key in selected_keys:
-        results_by_platform[_PLATFORM_LABELS[key]] = {}
+        results_by_platform[_PLATFORM_LABELS[key]] = dict(preflight_by_platform[key])
+
+    def execute_platform(key, loaded, context):
+        if key == "shutterstock":
+            from upload.shutterstock import upload_batch
+            return _run_platform_batch(
+                loaded, lambda chunk: upload_batch(chunk, context),
+                _BATCH_LIMIT[key], key,
+            )
+        if key == "px500":
+            _px500.ensure_login(context)
+            return _run_platform_batch(
+                loaded, lambda chunk: _px500.upload_batch(chunk, context),
+                _BATCH_LIMIT[key], key,
+            )
+        if key == "tuchong":
+            import upload.tuchong as adapter
+            adapter.ensure_login(context)
+        elif key == "adobestock":
+            import upload.adobestock as adapter
+        else:
+            import upload.istock as adapter
+            adapter.ensure_login(context)
+        return _run_platform_batch(
+            loaded, lambda chunk: adapter.upload_batch(chunk, context),
+            _BATCH_LIMIT[key], key,
+        )
 
     with sync_playwright() as pw:
-        ss_ctx = get_context("shutterstock", pw) if prepared.get("shutterstock") else None
-        px_ctx = get_context("px500", pw) if prepared.get("px500") else None
-        tc_ctx = get_context("tuchong", pw) if prepared.get("tuchong") else None
-        adobe_ctx = get_context("adobestock", pw) if prepared.get("adobestock") else None
-        istock_ctx = get_context("istock", pw) if prepared.get("istock") else None
-
-        try:
-            # Shutterstock: batch upload all images in one file-chooser call
-            if ss_ctx:
-                from upload.shutterstock import upload_batch as ss_batch
-                loaded = prepared["shutterstock"]
-                batch_results = _run_platform_batch(loaded, lambda c: ss_batch(c, ss_ctx), _BATCH_LIMIT["shutterstock"], "shutterstock")
-                results_by_platform["Shutterstock"] = batch_results
-                record("shutterstock", batch_results)
-
-            # 500px: batch — select all files at once, fill metadata per draft page
-            if px_ctx:
-                _px500.ensure_login(px_ctx)
-                loaded = prepared["px500"]
-                batch_results = _run_platform_batch(loaded, lambda c: _px500.upload_batch(c, px_ctx), _BATCH_LIMIT["px500"], "px500")
-                results_by_platform["500px/VCG"] = batch_results
-                record("px500", batch_results)
-
-            # Tuchong: batch — upload all, fill metadata per image, then submit
-            if tc_ctx:
-                import upload.tuchong as _tuchong
-                _tuchong.ensure_login(tc_ctx)
-                loaded = prepared["tuchong"]
-                batch_results = _run_platform_batch(loaded, lambda c: _tuchong.upload_batch(c, tc_ctx), _BATCH_LIMIT["tuchong"], "tuchong")
-                results_by_platform["Tuchong"] = batch_results
-                record("tuchong", batch_results)
-
-            # Adobe Stock: batch — upload all, fill metadata tile by tile, then submit
-            if adobe_ctx:
-                from upload.adobestock import upload_batch as adobe_batch
-                loaded = prepared["adobestock"]
-                batch_results = _run_platform_batch(loaded, lambda c: adobe_batch(c, adobe_ctx), _BATCH_LIMIT["adobestock"], "adobestock")
-                results_by_platform["Adobe Stock"] = batch_results
-                record("adobestock", batch_results)
-
-            # iStock / Getty Images: batch — upload all, fill metadata per image, then submit
-            if istock_ctx:
-                import upload.istock as _istock
-                _istock.ensure_login(istock_ctx)
-                loaded = prepared["istock"]
-                batch_results = _run_platform_batch(loaded, lambda c: _istock.upload_batch(c, istock_ctx), _BATCH_LIMIT["istock"], "istock")
-                results_by_platform["Getty/iStock"] = batch_results
-                record("istock", batch_results)
-        finally:
-            if ss_ctx:
-                ss_ctx.close()
-            if px_ctx:
-                px_ctx.close()
-            if tc_ctx:
-                tc_ctx.close()
-            if adobe_ctx:
-                adobe_ctx.close()
-            if istock_ctx:
-                istock_ctx.close()
+        for key in selected_keys:
+            loaded = prepared[key]
+            if not loaded:
+                continue
+            context = None
+            try:
+                context = get_context(key, pw)
+                batch_results = execute_platform(key, loaded, context)
+            except Exception as error:
+                print(f"  [fail] {_PLATFORM_LABELS[key]} aborted: {error}", flush=True)
+                batch_results = {
+                    image.name: UploadStatus.FAILED for image, _ in loaded
+                }
+            finally:
+                if context is not None:
+                    context.close()
+            results_by_platform[_PLATFORM_LABELS[key]].update(batch_results)
+            record(key, batch_results)
 
     print("\nUpload summary:", flush=True)
     platform_keys = {label: key for key, label in _PLATFORM_LABELS.items()}
     for label, batch_results in results_by_platform.items():
-        ok, fail = _result_counts(batch_results)
-        suffix = f", {fail} need review or failed" if fail else ""
+        counts = {
+            status: sum(1 for value in batch_results.values() if value == status)
+            for status in UploadStatus
+        }
+        details = ", ".join(
+            f"{count} {status.value}"
+            for status, count in counts.items()
+            if count
+        ) or "no work"
         skipped = skipped_by_platform.get(platform_keys[label], 0)
         skipped_text = f", {skipped} previously completed" if skipped else ""
         print(
-            f"  {label}: {ok}/{len(batch_results)} completed{suffix}{skipped_text}",
+            f"  {label}: {details}{skipped_text}",
             flush=True,
         )
+    return all(
+        status.completed
+        for batch_results in results_by_platform.values()
+        for status in batch_results.values()
+    )
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="Upload stock photos to image platforms")
     parser.add_argument("directory", help="Directory containing images and their JSON metadata")
     parser.add_argument(
@@ -260,6 +305,11 @@ def main():
     )
     parser.add_argument("--dry-run", action="store_true", help="List pairs without uploading")
     parser.add_argument("--force", action="store_true", help="Upload even if history marks the image complete")
+    parser.add_argument(
+        "--allow-unbound-metadata",
+        action="store_true",
+        help="Allow legacy JSON files without source_sha256 (source name is still checked)",
+    )
     args = parser.parse_args()
 
     target = Path(args.directory).expanduser().resolve()
@@ -284,10 +334,15 @@ def main():
 
     if args.dry_run:
         print("\nDry run — no uploads performed.")
-        return
+        return 0
 
-    run_upload(pairs, args.platform, force=args.force)
+    return 0 if run_upload(
+        pairs,
+        args.platform,
+        force=args.force,
+        allow_unbound_metadata=args.allow_unbound_metadata,
+    ) else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -2,7 +2,7 @@
 
 Bilingual stock photo metadata generator and publisher for Shutterstock, 500px.com.cn, Tuchong, and Adobe Stock.
 
-Given a photo (or a directory of photos), it uses the Claude vision API to generate English and Chinese titles, descriptions, keywords, and categories — then automates the upload via a real browser.
+Given a photo (or a directory of photos), the project can use Codex or Claude's native image understanding to generate English and Chinese titles, descriptions, keywords, and categories, then automate uploads through a real browser. A standalone Anthropic API generator remains available as an optional fallback.
 
 ## Supported platforms
 
@@ -19,27 +19,50 @@ Given a photo (or a directory of photos), it uses the Claude vision API to gener
 
 ## Prerequisites
 
-**Python packages**
+Python 3.9 or newer is supported.
+
+**Agent-native metadata generation**
+
+Open the repository in Codex or Claude Code. No AI SDK or separate API key is required when the host can inspect local images. Install the local preview and upload dependencies:
 
 ```bash
-pip install anthropic pillow playwright
-python -m playwright install chromium
+pip install -r requirements.txt
 ```
 
-**Claude API access**
+The skill sends temporary previews to the host model instead of original files by default. Previews are EXIF-corrected JPEGs with metadata removed and a maximum edge of 1024 pixels. They are deleted after metadata generation; source photos are never modified.
+
+**Browser upload**
+
+Run `python -m playwright install chromium` to provide the fallback browser. The uploader prefers Google Chrome when installed and otherwise uses Playwright Chromium.
+
+**Optional standalone Anthropic fallback**
+
+Install these only when running `photo_desc.py` directly:
 
 ```bash
+pip install -r requirements-anthropic.txt
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 ## Usage
 
-### With Claude Code (recommended)
+### With Codex
+
+Open this project in Codex and invoke the repository skill or ask naturally:
+
+```text
+$publish-photos /path/to/dir --metadata-only
+Generate stock photo descriptions for /path/to/dir
+$publish-photos /path/to/dir --platform shutterstock
+```
+
+### With Claude Code
 
 Open this project in [Claude Code](https://claude.ai/code) and run:
 
-```
+```text
 /publish-photos /path/to/dir
+/publish-photos /path/to/dir --metadata-only
 /publish-photos /path/to/dir --platform shutterstock
 /publish-photos /path/to/dir --platform px500
 /publish-photos /path/to/dir --platform tuchong
@@ -47,22 +70,40 @@ Open this project in [Claude Code](https://claude.ai/code) and run:
 /publish-photos /path/to/dir --dry-run
 ```
 
-Claude handles the full pipeline automatically:
-1. Generate metadata (skips images that already have a JSON)
-2. Upload to the target platform(s)
-3. Report results and guide you through any login prompts
+Both agent skills follow the same workflow:
 
-### Without Claude Code
+1. Create temporary 1024px previews and generate metadata (skips images that already have JSON)
+2. Remove the previews
+3. Upload only when explicitly requested
+4. Report results and guide you through any login prompts
 
-Run the two scripts manually:
+The copies under `.agents/skills/` and `.claude/skills/` are intentionally identical. Their instructions avoid host-specific tool names, so each agent uses its own image and process tools.
+
+### Standalone Anthropic API fallback
+
+Use this when the current agent cannot inspect local images, or when running outside an agent host:
 
 ```bash
-# Step 1 — generate metadata
 python3 photo_desc.py /path/to/dir
+python3 photo_desc.py /path/to/dir --context "SLC road trip"
+```
 
-# Step 2 — upload
+This path requires the optional Anthropic dependencies and credentials above. It is not used by the normal Codex or Claude native workflow.
+
+### Prepare previews manually
+
+```bash
+python3 prepare_images.py /path/to/dir
+python3 prepare_images.py --cleanup /tmp/stock-photo-previews-abc123/preview_manifest.json
+```
+
+The command prints the exact manifest path. Pass that path back to `--cleanup`; cleanup refuses directories that were not created and marked by this tool.
+
+### Upload manually
+
+```bash
 python3 upload_photos.py /path/to/dir --platform shutterstock
-python3 upload_photos.py /path/to/dir --platform shutterstock --force  # intentionally re-upload
+python3 upload_photos.py /path/to/dir --platform shutterstock --force
 ```
 
 `--platform all` runs the stable platforms. Getty/iStock remains experimental and
@@ -71,6 +112,11 @@ must be selected explicitly with `--platform istock`.
 Completed uploads are tracked by image content hash in
 `.stock_upload_history.json` beside the photos. Subsequent runs skip completed
 images for that platform unless `--force` is supplied.
+History distinguishes `uploaded`, `draft_saved`, and `submitted`. An `uploaded`
+result is recorded to prevent duplicate transfer but returns a nonzero exit status
+until metadata is confirmed saved. Legacy JSON
+without a source hash is blocked by default; use `--allow-unbound-metadata` only
+for trusted older metadata that cannot be regenerated.
 
 ## First run (browser login)
 
@@ -78,12 +124,15 @@ On the first run for each platform, a browser window opens. Log in with your acc
 
 ## Output format
 
-Each image produces a timestamped JSON file alongside it, e.g. `DSC00012_20260418_132943.json`:
+Each image produces a timestamped JSON file alongside it, e.g. `DSC00012.jpg_20260418_132943_123456.json`:
 
 ```json
 {
   "source": "DSC00012.jpg",
+  "source_sha256": "...",
+  "source_size": 12345678,
   "generated_at": "2026-04-18 13:29:43",
+  "quality_warnings": [],
   "title_en": "...",
   "title_zh": "...",
   "description_en": "...",
@@ -91,11 +140,16 @@ Each image produces a timestamped JSON file alongside it, e.g. `DSC00012_2026041
   "keywords_en": ["...", "..."],
   "keywords_zh": ["...", "..."],
   "category1": "Nature",
-  "category2": "Parks/Outdoor"
+  "category2": "Parks/Outdoor",
+  "location_zh": "",
+  "core_keywords_zh": ["..."],
+  "commercial_uses_en": ["travel marketing"],
+  "release_status": "clear",
+  "release_notes": ""
 }
 ```
 
-If you run metadata generation on the same image twice, the newest JSON is used automatically.
+If you run metadata generation on the same image twice, the newest JSON is used automatically. Upload verifies the exact filename and SHA-256 before opening a browser.
 
 ## Platform limits (enforced automatically)
 
@@ -103,7 +157,7 @@ If you run metadata generation on the same image twice, the newest JSON is used 
 |---|---|---|---|---|
 | Title / Description | ≤ 2048 chars | ≤ 50 chars | title ≤ 70 chars | title ≤ 200 chars |
 | Keywords | up to 50, ordered by relevance | up to 35 | up to 49 (first 10 strongest) | ≤ 50 |
-| Categories | 1 required + 1 optional | — | 1 required (from 16 fixed options) | 1 required |
+| Categories | 1 required + 1 optional | — | 1 required (mapped taxonomy) | 1 required |
 
 ## Tuchong draft cleanup
 
@@ -138,18 +192,30 @@ The script reuses the `.session/tuchong` browser session. On the first run it wi
 ## Project structure
 
 ```
-photo_desc.py          # metadata generator (Claude vision API)
+metadata_contract.json # shared agent output contract
+metadata_core.py       # shared prompt, limits, validation, and persistence
+metadata_writer.py     # standard-library writer for native agent output
+prepare_images.py      # temporary 1024px, metadata-free preview generator
+photo_desc.py          # optional standalone Anthropic API fallback
+requirements.txt       # preview and browser upload dependencies
+requirements-anthropic.txt  # standalone Anthropic fallback dependencies
 upload_photos.py       # upload CLI
 upload/
   browser.py           # shared: persistent browser context, login helper
+  confirmation.py      # post-action success confirmation helper
+  status.py            # explicit upload lifecycle states
   shutterstock.py      # Shutterstock upload automation
   px500.py             # 500px.com.cn upload automation
   tuchong.py           # Tuchong upload automation
   adobestock.py        # Adobe Stock upload automation
+  istock.py            # experimental Getty/iStock preparation (no auto-submit)
 cleanup_tuchong_drafts.py  # bulk-delete Tuchong draft folders
 debug_selectors.py         # interactive DOM inspector for debugging selectors
+.agents/skills/
+  publish-photos/
+    SKILL.md           # Codex / Agent Skills entry
 .claude/skills/
   publish-photos/
-    SKILL.md           # /publish-photos Claude Code skill
+    SKILL.md           # Claude Code skill (same portable workflow)
 .session/              # browser sessions (git-ignored)
 ```

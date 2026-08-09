@@ -20,6 +20,8 @@ if "playwright.sync_api" not in sys.modules:
     sys.modules["playwright.sync_api"] = sync_api
 
 from upload.adobestock import _auto_review_reason as adobe_review_reason
+from upload.adobestock import _extract_original_filename as adobe_original_filename
+from upload.adobestock import _has_logged_in_session as adobe_session_ready
 from upload.adobestock import _resolve_category as resolve_adobe_category
 from upload.adobestock import upload_batch as upload_adobe_batch
 from upload.istock import _auto_review_reason as istock_review_reason
@@ -30,8 +32,10 @@ from upload.status import UploadStatus
 import upload.browser as browser_module
 from upload.confirmation import wait_for_success_text
 from upload.shutterstock import _has_logged_in_session as shutterstock_session_ready
+from upload.tuchong import _login_page_session_ready as tuchong_login_ready
 from upload_photos import (
     _image_digest,
+    _history_entry_completed,
     _load_history,
     _platform_enabled,
     _save_history,
@@ -43,6 +47,39 @@ from cleanup_tuchong_drafts import DraftCard, _delete_card
 
 
 class UploadLogicTests(unittest.TestCase):
+    def test_adobe_original_filename_ignores_footer_actions(self):
+        footer = (
+            "File ID(s): 2151393607 - Original name(s): DSC01452.jpg"
+            "Actions:Erase all keywordsRefresh auto-category"
+        )
+        self.assertEqual(adobe_original_filename(footer), "DSC01452.jpg")
+
+    def test_adobe_login_requires_contributor_ui(self):
+        class Locator:
+            def __init__(self, count):
+                self._count = count
+
+            def count(self):
+                return self._count
+
+        class Page:
+            url = "https://contributor.stock.adobe.com/en/"
+
+            def __init__(self, control_count):
+                self.control_count = control_count
+
+            def locator(self, _selector):
+                return Locator(self.control_count)
+
+        self.assertFalse(adobe_session_ready(Page(0)))
+        self.assertTrue(adobe_session_ready(Page(1)))
+
+    def test_uploaded_history_entry_remains_resumable(self):
+        self.assertFalse(_history_entry_completed({"status": "uploaded"}))
+        self.assertTrue(_history_entry_completed({"status": "draft_saved"}))
+        self.assertTrue(_history_entry_completed({"status": "submitted"}))
+        self.assertTrue(_history_entry_completed({"filename": "legacy.jpg"}))
+
     def test_500px_browser_uses_system_dns_fallback(self):
         address = (
             browser_module.socket.AF_INET,
@@ -429,6 +466,7 @@ class UploadLogicTests(unittest.TestCase):
 
         page = Page()
         initial_calls = []
+        prepared = []
         poll_results = iter([False, True])
 
         def navigating_check():
@@ -441,10 +479,12 @@ class UploadLogicTests(unittest.TestCase):
                 navigating_check,
                 "https://example.com/login",
                 poll_logged_in=lambda: next(poll_results),
+                prepare_login=lambda: prepared.append(page.urls[-1]),
             )
 
         self.assertEqual(len(initial_calls), 1)
         self.assertEqual(page.urls, ["https://example.com/login"])
+        self.assertEqual(prepared, ["https://example.com/login"])
         self.assertEqual(page.waits, 2)
 
     def test_login_navigation_timeout_keeps_waiting_for_user(self):
@@ -485,6 +525,22 @@ class UploadLogicTests(unittest.TestCase):
         self.assertFalse(shutterstock_session_ready(Page()))
         Page.url = "https://submit.shutterstock.com/portfolio/not_submitted/photo"
         self.assertTrue(shutterstock_session_ready(Page()))
+
+    def test_tuchong_login_poll_reads_spa_state_without_navigation(self):
+        class Page:
+            def __init__(self):
+                self.evaluations = 0
+
+            def evaluate(self, expression):
+                self.evaluations += 1
+                return True
+
+            def goto(self, *args, **kwargs):
+                raise AssertionError("login polling must not navigate")
+
+        page = Page()
+        self.assertTrue(tuchong_login_ready(page))
+        self.assertEqual(page.evaluations, 1)
 
     def test_success_confirmation_uses_keyword_only_playwright_arg(self):
         class Page:

@@ -83,7 +83,17 @@ def _auto_review_reason(meta: dict) -> str:
 
 def _has_logged_in_session(page: Page) -> bool:
     url = page.url.lower()
-    return "contributor.stock.adobe.com" in url and "login" not in url
+    if "contributor.stock.adobe.com" not in url or "login" in url:
+        return False
+    try:
+        # Adobe first renders the contributor shell, then may asynchronously
+        # redirect to federated sign-in.  Require contributor UI as well as
+        # the URL so that transient shell is not mistaken for a session.
+        return page.locator(
+            "button:has-text('Upload'), a[href*='/uploads']"
+        ).count() > 0
+    except Exception:
+        return False
 
 
 def _is_logged_in(page: Page) -> bool:
@@ -97,7 +107,7 @@ def _is_logged_in(page: Page) -> bool:
 
 
 def _navigate_to_uploads(page: Page) -> None:
-    """Navigate to the uploads page, then click Upload to open the file-drop modal."""
+    """Navigate to the uploads page without starting a new upload."""
     from urllib.parse import urlparse
     page.goto(PORTAL_URL, wait_until="domcontentloaded", timeout=20_000)
     page.wait_for_timeout(2_000)
@@ -109,6 +119,9 @@ def _navigate_to_uploads(page: Page) -> None:
     uploads_url = f"{parsed.scheme}://{parsed.netloc}/{locale}/uploads"
     page.goto(uploads_url, wait_until="domcontentloaded", timeout=20_000)
 
+
+def _open_upload_modal(page: Page) -> None:
+    """Click Upload and wait for Adobe's file-drop modal."""
     # Click Upload button to open the modal (exposes the hidden file input).
     # Adobe Spectrum adds is-disabled class while previous uploads are still processing.
     # Poll for up to 3 min, then try anyway (click will fail gracefully if still disabled).
@@ -136,8 +149,15 @@ def _count_tiles(page: Page) -> int:
     return page.locator(_TILE_SEL).count()
 
 
+def _extract_original_filename(footer: str) -> Optional[str]:
+    match = re.search(
+        r"Original name\(s\):\s*(.+?)(?:\s*Actions:|[\r\n]|$)", footer
+    )
+    return match.group(1).strip() if match else None
+
+
 def _build_tile_map(page: Page, start: int, total: int) -> dict[str, int]:
-    """Scan newly uploaded tiles and return filename → tile-index mapping."""
+    """Scan tiles and return original filename → current tile-index mapping."""
     mapping: dict[str, int] = {}
     tiles = page.locator(_TILE_SEL)
     for idx in range(start, total):
@@ -145,9 +165,9 @@ def _build_tile_map(page: Page, start: int, total: int) -> dict[str, int]:
             tiles.nth(idx).click()
             page.wait_for_timeout(400)
             footer = page.locator("[data-t='asset-sidebar-footer']").inner_text(timeout=3_000)
-            m = re.search(r"Original name\(s\): (.+)", footer)
-            if m:
-                mapping[m.group(1).strip()] = idx
+            filename = _extract_original_filename(footer)
+            if filename:
+                mapping[filename] = idx
         except Exception:
             pass
     return mapping
@@ -263,7 +283,16 @@ def _fill_metadata(page: Page, img: Path, meta: dict) -> bool:
             timeout=15_000,
         )
         page.locator("[data-t='save-work']").first.click()
-        return wait_for_success_text(page, ["saved", "work saved", "已保存"])
+        try:
+            # The current Adobe UI no longer shows the old Saved toast.  Once
+            # persistence completes, Save work returns to its disabled state.
+            page.wait_for_function(
+                "() => { const b = document.querySelector('[data-t=\"save-work\"]'); return b && b.disabled; }",
+                timeout=10_000,
+            )
+            return True
+        except PWTimeout:
+            return wait_for_success_text(page, ["saved", "work saved", "已保存"])
     except PWTimeout:
         print(f"  [warn] {img.name}: Save work still disabled — check required fields")
         return False
@@ -296,28 +325,44 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
         _navigate_to_uploads(page)
 
         pre_count = _count_tiles(page)
+        tile_map = _build_tile_map(page, 0, pre_count)
+        missing_pairs = [(img, meta) for img, meta in pairs if img.name not in tile_map]
 
-        # Trigger file chooser via the Browse button in the modal, then set files.
-        # set_input_files() on the hidden input alone doesn't fire React's change handler.
-        browse_btn = page.locator("button._9-Xiq_spectrum-Link, a:has-text('Browse'), button:has-text('Browse')").first
-        browse_btn.wait_for(state="visible", timeout=10_000)
-        with page.expect_file_chooser(timeout=10_000) as fc_info:
-            browse_btn.click()
-        fc_info.value.set_files([str(img) for img, _ in pairs])
-        print(f"  Uploading {len(pairs)} file(s) to Adobe Stock...", flush=True)
+        if missing_pairs:
+            _open_upload_modal(page)
+            # Trigger file chooser via Browse. Setting the hidden input directly
+            # does not fire Adobe's React change handler.
+            browse_btn = page.locator(
+                "button._9-Xiq_spectrum-Link, a:has-text('Browse'), "
+                "button:has-text('Browse')"
+            ).first
+            browse_btn.wait_for(state="visible", timeout=10_000)
+            with page.expect_file_chooser(timeout=10_000) as fc_info:
+                browse_btn.click()
+            fc_info.value.set_files([str(img) for img, _ in missing_pairs])
+            print(
+                f"  Uploading {len(missing_pairs)} file(s) to Adobe Stock...",
+                flush=True,
+            )
 
-        # Wait for all new tiles to appear
-        expected = pre_count + len(pairs)
-        page.wait_for_function(
-            f"() => document.querySelectorAll(\"{_TILE_SEL}\").length >= {expected}",
-            timeout=600_000,
-        )
-        page.wait_for_timeout(2_000)
+            expected = pre_count + len(missing_pairs)
+            page.wait_for_function(
+                f"() => document.querySelectorAll(\"{_TILE_SEL}\").length >= {expected}",
+                timeout=600_000,
+            )
+            page.wait_for_timeout(2_000)
+            # Adobe inserts recent uploads at the front, so rebuild across the
+            # entire gallery instead of assuming new tiles were appended.
+            tile_map = _build_tile_map(page, 0, expected)
+        else:
+            print(
+                f"  Resuming {len(pairs)} existing Adobe Stock upload(s)...",
+                flush=True,
+            )
+
         for img, _ in pairs:
-            results[img.name] = UploadStatus.UPLOADED
-
-        # Build filename→tile-index mapping (tile order may differ from upload order)
-        tile_map = _build_tile_map(page, pre_count, expected)
+            if img.name in tile_map:
+                results[img.name] = UploadStatus.UPLOADED
 
         # Fill metadata using the correct tile for each image
         saved_names: list[str] = []

@@ -100,6 +100,7 @@ def ensure_logged_in(
     login_url: str,
     *,
     poll_logged_in: Optional[Callable[[], bool]] = None,
+    prepare_login: Optional[Callable[[], None]] = None,
 ) -> None:
     poll_check = poll_logged_in or is_logged_in
     if not is_logged_in():
@@ -110,6 +111,8 @@ def ensure_logged_in(
             # Some contributor portals never finish the load event. Once
             # navigation has started, keep the browser open for manual login.
             pass
+        if prepare_login is not None:
+            prepare_login()
         try:
             print("Press Enter here when done...", flush=True)
             input()

@@ -84,6 +84,19 @@ def _image_digest(path: Path) -> str:
     return image_sha256(path)
 
 
+def _history_entry_completed(entry: object) -> bool:
+    """Treat legacy records as complete, but allow uploaded-only work to resume."""
+    if not isinstance(entry, dict):
+        return True
+    value = entry.get("status")
+    if value is None:
+        return True
+    try:
+        return UploadStatus(value).completed
+    except ValueError:
+        return False
+
+
 def _validate_metadata_binding(image: Path, metadata: dict, allow_unbound: bool) -> None:
     if image.stat().st_size <= 0:
         raise ValueError("image file is empty")
@@ -179,7 +192,8 @@ def run_upload(
         skipped = 0
         preflight_results = {}
         for img, json_path in pairs:
-            if not force and digests[img.name] in completed:
+            entry = completed.get(digests[img.name])
+            if not force and entry is not None and _history_entry_completed(entry):
                 skipped += 1
                 continue
             try:

@@ -29,6 +29,11 @@ _CATEGORY_MAP: dict[str, list[str]] = {
     "Travel":       ["自然风光", "城市风光"],
     "Architecture": ["城市风光"],
     "Buildings":    ["城市风光"],
+    "Backgrounds/Textures": ["自然风光"],
+    "Industrial":   ["城市风光"],
+    "Parks/Outdoor": ["自然风光"],
+    "Signs/Symbols": ["自然风光"],
+    "Transportation": ["自然风光"],
     "Animals":      ["野生动物"],
     "Wildlife":     ["野生动物"],
     "Food":         ["静物美食"],
@@ -51,19 +56,45 @@ def _is_logged_in(page: Page) -> bool:
         return False
 
 
+def _login_page_session_ready(page: Page) -> bool:
+    """Read the SPA's in-place login state without navigating or opening a tab."""
+    try:
+        return bool(
+            page.evaluate(
+                """() => {
+                    const data = window.commonData || {};
+                    return Boolean(
+                        data.userId && data.qualified === 2 && data.bound === 1
+                    );
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
 def ensure_login(context: BrowserContext) -> None:
     """Check login once before batch upload."""
-    # Poll on a fresh page each time so the login page isn't navigated away from.
-    def poll_logged_in() -> bool:
-        p = context.new_page()
-        try:
-            return _is_logged_in(p)
-        finally:
-            p.close()
-
     login_page = context.new_page()
     try:
-        ensure_logged_in(login_page, poll_logged_in, LOGIN_URL)
+        if _is_logged_in(login_page):
+            return
+
+        def open_login_form() -> None:
+            login_link = login_page.get_by_text("登录", exact=True)
+            login_link.first.wait_for(state="visible", timeout=30_000)
+            login_link.first.click()
+            login_page.get_by_placeholder(
+                "请输入手机号/用户名/邮箱"
+            ).wait_for(state="visible", timeout=10_000)
+
+        ensure_logged_in(
+            login_page,
+            lambda: False,
+            LOGIN_URL,
+            poll_logged_in=lambda: _login_page_session_ready(login_page),
+            prepare_login=open_login_form,
+        )
     finally:
         login_page.close()
 
@@ -111,33 +142,38 @@ def _fill_metadata(page: Page, metadata: dict) -> bool:
             "}",
             timeout=30_000,
         )
-        form.locator("input.ant-input[placeholder='请选择']").click(timeout=5_000)
-        # Wait for modal to appear AND let its CSS animation finish before clicking.
-        # The locator resolves as soon as the DOM node exists,
-        # but clicks during the slide-in animation are often dropped by the browser.
-        page.wait_for_selector("text=摄影图片类", timeout=10_000)
-        page.wait_for_timeout(600)
-        selected_categories = 0
-        for cat in cats:
-            try:
-                # Scope to [role='dialog'] so we don't hit page elements that
-                # happen to contain the same text before the modal in DOM order.
-                dialog = page.locator("[role='dialog']")
-                target = (
-                    dialog.locator(f"text={cat}").first
-                    if dialog.count() > 0
-                    else page.locator(f"text={cat}").first
-                )
-                target.click(timeout=5_000)
-                selected_categories += 1
-                page.wait_for_timeout(400)
-            except PWTimeout:
-                pass
+        category_input = form.locator(
+            "input.ant-input[placeholder='请选择']"
+        ).first
+        current_categories = category_input.input_value()
+        if cats and all(cat in current_categories for cat in cats):
+            selected_categories = len(cats)
+        else:
+            category_input.click(timeout=5_000)
+            # Wait for the modal and its slide-in animation to finish.
+            page.wait_for_selector("text=摄影图片类", timeout=10_000)
+            page.wait_for_timeout(600)
+            selected_categories = 0
+            for cat in cats:
+                try:
+                    dialog = page.locator("[role='dialog']")
+                    target = (
+                        dialog.locator(f"text={cat}").first
+                        if dialog.count() > 0
+                        else page.locator(f"text={cat}").first
+                    )
+                    target.click(timeout=5_000)
+                    selected_categories += 1
+                    page.wait_for_timeout(400)
+                except PWTimeout:
+                    pass
+            page.locator(
+                "button:has-text('确认'), button:has-text('确 认')"
+            ).first.click(timeout=5_000)
+            page.wait_for_timeout(1_000)
         if selected_categories == 0:
             complete = False
             print("  [warn] no image category could be selected")
-        page.locator("button:has-text('确认'), button:has-text('确 认')").first.click(timeout=5_000)
-        page.wait_for_timeout(1_000)  # wait for modal to close fully
     except PWTimeout as e:
         print(f"  [warn] category field failed: {e}")
         complete = False
@@ -167,9 +203,18 @@ def _fill_metadata(page: Page, metadata: dict) -> bool:
     try:
         kw_sel = form.locator(".ant-select-selection--multiple").first
         kw_sel.scroll_into_view_if_needed()
-        kw_sel.click()
+        remove_buttons = kw_sel.locator(".ant-select-selection__choice__remove")
+        for _ in range(35):
+            if remove_buttons.count() == 0:
+                break
+            remove_buttons.first.click(force=True, timeout=5_000)
+            page.wait_for_timeout(80)
+        # Removing a tag opens Ant Design's suggestion overlay.  Focus the
+        # actual input directly so that overlay cannot intercept the click.
+        page.keyboard.press("Escape")
         page.wait_for_timeout(300)
         kw_input = kw_sel.locator("input.ant-select-search__field")
+        kw_input.click(force=True, timeout=5_000)
         for kw in keywords:
             kw_input.type(kw)
             kw_input.press("Enter")

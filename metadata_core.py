@@ -3,6 +3,7 @@
 import json
 import hashlib
 import re
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -46,12 +47,16 @@ Your job is to create metadata that helps real stock-image buyers find, trust, a
 
 Optimize for commercial usefulness:
 - Be visually accurate first. Never invent objects, locations, species, demographics, landmarks, brands, events, or people that are not visible or supplied in context.
+- Ground each result in the image being processed. Never copy a scene classification from an adjacent filename or assume consecutive frames show the same subjects.
+- Distinguish shooting context from visible content. Context may establish location, but do not say a lake, river, building, person, or other subject is visible unless it is actually in the image.
+- Similar burst frames may share core facts, but account for any visible change in subject, foreground, activity, structure, text, logo, or release risk.
 - Think like a buyer: include subject, action, setting, season/time, mood, composition/viewpoint, color, use case, and commercially useful concepts when genuinely supported.
 - Put the most important search terms first. The first 10 English keywords should carry the core subject and buyer intent.
 - Prefer specific terms over filler. Avoid keyword stuffing, repeated word stems, near-duplicates, camera/gear terms, file info, links, emojis, and unrelated trends.
 - Avoid trademarks, brand/product names, artist names, fictional characters, and private personal information for commercial submissions.
 - Put visible logos, recognizable private property, or recognizable people that may need review only in release_notes, never in keywords.
 - Use neutral, respectful language. Do not infer sensitive identity traits unless clearly visible or supplied by context.
+- Keep descriptions factual and image-specific. Do not pad them with generic phrases such as "Presented as" or rotate adjectives to simulate variation.
 
 Platform targets:
 - title_en: natural phrase, max {TITLE_EN_MAX} characters
@@ -180,6 +185,24 @@ def validate_metadata(result: dict) -> list[str]:
     return errors
 
 
+def validate_metadata_quality(result: dict) -> list[str]:
+    """Return quality defects that should block persistence and upload."""
+    errors = []
+    description_en = clean_text(result.get("description_en", ""))
+    if re.search(r"\bpresented as\b", description_en, flags=re.IGNORECASE):
+        errors.append("description_en contains generic 'Presented as' filler")
+
+    release_status = result.get("release_status")
+    release_notes = clean_text(result.get("release_notes", ""))
+    if release_status == "clear" and release_notes:
+        errors.append("release_notes must be empty when release_status is clear")
+    if release_status in {"required", "unknown"} and not release_notes:
+        errors.append(
+            "release_notes must explain required or unknown release status"
+        )
+    return errors
+
+
 def assess_metadata_quality(result: dict) -> list[str]:
     warnings = []
     if len(result.get("keywords_en", [])) < 20:
@@ -192,6 +215,47 @@ def assess_metadata_quality(result: dict) -> list[str]:
     return warnings
 
 
+def find_batch_quality_issues(
+    records: list[tuple[str, dict]], *, lead_repeat_limit: int = 5
+) -> dict[str, list[str]]:
+    """Find repeated metadata that can hide scene-boundary classification errors."""
+    issues: dict[str, list[str]] = defaultdict(list)
+    field_groups: dict[str, dict[str, list[str]]] = {
+        "title_en": defaultdict(list),
+        "description_en": defaultdict(list),
+    }
+    lead_groups: dict[str, list[str]] = defaultdict(list)
+
+    for source, metadata in records:
+        for field, groups in field_groups.items():
+            value = clean_text(metadata.get(field, "")).casefold()
+            if value:
+                groups[value].append(source)
+        description = clean_text(metadata.get("description_en", ""))
+        lead = re.split(r"[.!?]", description, maxsplit=1)[0].strip().casefold()
+        if lead:
+            lead_groups[lead].append(source)
+
+    for field, groups in field_groups.items():
+        for sources in groups.values():
+            if len(sources) < 2:
+                continue
+            message = f"duplicate {field} shared by {len(sources)} images"
+            for source in sources:
+                issues[source].append(message)
+
+    for sources in lead_groups.values():
+        if len(sources) <= lead_repeat_limit:
+            continue
+        message = (
+            "description_en factual lead is repeated across "
+            f"{len(sources)} images (limit {lead_repeat_limit})"
+        )
+        for source in sources:
+            issues[source].append(message)
+    return dict(issues)
+
+
 def image_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as image_file:
@@ -200,20 +264,40 @@ def image_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def write_metadata(result: dict, image_path: Path, output_dir: Path) -> Path:
+def write_metadata(
+    result: dict,
+    image_path: Path,
+    output_dir: Path,
+    *,
+    visual_review_status: str = "unreviewed",
+    visual_review_method: str = "",
+) -> Path:
     """Normalize, validate, and write one timestamped metadata JSON file."""
     normalized = enforce_limits(result)
-    errors = validate_metadata(normalized)
+    errors = validate_metadata(normalized) + validate_metadata_quality(normalized)
     if errors:
         raise ValueError("; ".join(errors))
+    if visual_review_status not in {"unreviewed", "verified"}:
+        raise ValueError("visual_review_status must be unreviewed or verified")
+    visual_review_method = clean_text(visual_review_method)
+    if visual_review_status == "verified" and not visual_review_method:
+        raise ValueError("verified metadata requires visual_review_method")
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    now = datetime.now()
+    timestamp = now.strftime("%Y%m%d_%H%M%S_%f")
     out_file = output_dir / f"{image_path.name}_{timestamp}.json"
     payload = {
         "source": image_path.name,
         "source_sha256": image_sha256(image_path),
         "source_size": image_path.stat().st_size,
-        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "visual_review_status": visual_review_status,
+        "visual_review_method": visual_review_method,
+        "visual_reviewed_at": (
+            now.strftime("%Y-%m-%d %H:%M:%S")
+            if visual_review_status == "verified"
+            else ""
+        ),
         "quality_warnings": assess_metadata_quality(normalized),
         **normalized,
     }

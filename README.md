@@ -72,10 +72,15 @@ Open this project in [Claude Code](https://claude.ai/code) and run:
 
 Both agent skills follow the same workflow:
 
-1. Create temporary 1024px previews and generate metadata (skips images that already have JSON)
-2. Remove the previews
-3. Upload only when explicitly requested
-4. Report results and guide you through any login prompts
+1. Create temporary 1024px previews and generate per-image visual facts and metadata
+2. Build filename-and-metadata contact sheets and inspect every proposed description
+3. Run strict batch validation, then write SHA-bound metadata marked as visually verified
+4. Remove the previews and audit sheets
+5. Upload only when explicitly requested, with another quality and review-status preflight
+
+Existing JSON is reused only when it is SHA-bound, visually verified, and passes
+the current quality checks. Merely having a JSON file no longer counts as a
+completed metadata workflow.
 
 The copies under `.agents/skills/` and `.claude/skills/` are intentionally identical. Their instructions avoid host-specific tool names, so each agent uses its own image and process tools.
 
@@ -88,7 +93,12 @@ python3 photo_desc.py /path/to/dir
 python3 photo_desc.py /path/to/dir --context "SLC road trip"
 ```
 
-This path requires the optional Anthropic dependencies and credentials above. It is not used by the normal Codex or Claude native workflow.
+This path requires the optional Anthropic dependencies and credentials above. It
+uses a 1024px generation preview followed by an independent 1536px visual
+verification pass. A rejected draft is regenerated once, and the completed batch
+is checked for repeated titles and descriptions before any repeated records are
+written. Metadata is not written when the second verification still fails. This
+path is not used by the normal Codex or Claude native workflow.
 
 ### Prepare previews manually
 
@@ -98,6 +108,34 @@ python3 prepare_images.py --cleanup /tmp/stock-photo-previews-abc123/preview_man
 ```
 
 The command prints the exact manifest path. Pass that path back to `--cleanup`; cleanup refuses directories that were not created and marked by this tool.
+
+### Audit and write native-agent metadata manually
+
+After creating a temporary metadata manifest, build contact sheets that bind each
+preview to its proposed title, description, keywords, and release assessment:
+
+```bash
+python3 metadata_contact_sheet.py \
+  --preview-manifest /tmp/stock-photo-previews-abc123/preview_manifest.json \
+  --metadata-manifest /tmp/proposed-metadata.json
+```
+
+Inspect every reported sheet, including its displayed English keywords and
+release status/notes, then use its receipt to write verified metadata:
+
+```bash
+python3 metadata_writer.py \
+  --manifest /tmp/proposed-metadata.json \
+  --strict-quality \
+  --visual-reviewed \
+  --review-method agent-native \
+  --audit-receipt /tmp/stock-photo-previews-abc123/metadata_audit_receipt.json
+```
+
+The writer validates the entire manifest before writing any file. Repeated titles
+or descriptions, repeated factual leads, generic filler, release-status
+contradictions, thin strict-mode keyword sets, and changed or mismatched audit
+artifacts block the batch.
 
 ### Upload manually
 
@@ -117,6 +155,10 @@ result is recorded to prevent duplicate transfer but returns a nonzero exit stat
 until metadata is confirmed saved. Legacy JSON
 without a source hash is blocked by default; use `--allow-unbound-metadata` only
 for trusted older metadata that cannot be regenerated.
+Unreviewed metadata, quality warnings, and repeated batch copy are also blocked by
+default. `--allow-unreviewed-metadata`, `--allow-quality-warnings`, and
+`--allow-repeated-metadata` are explicit manual overrides and should not be used
+by the normal skill workflow.
 
 ## First run (browser login)
 
@@ -132,6 +174,9 @@ Each image produces a timestamped JSON file alongside it, e.g. `DSC00012.jpg_202
   "source_sha256": "...",
   "source_size": 12345678,
   "generated_at": "2026-04-18 13:29:43",
+  "visual_review_status": "verified",
+  "visual_review_method": "agent-native",
+  "visual_reviewed_at": "2026-04-18 13:31:02",
   "quality_warnings": [],
   "title_en": "...",
   "title_zh": "...",
@@ -149,7 +194,10 @@ Each image produces a timestamped JSON file alongside it, e.g. `DSC00012.jpg_202
 }
 ```
 
-If you run metadata generation on the same image twice, the newest JSON is used automatically. Upload verifies the exact filename and SHA-256 before opening a browser.
+If you run metadata generation on the same image twice, the newest JSON is used
+automatically. Upload verifies the exact filename, SHA-256, metadata contract,
+quality warnings, batch uniqueness, and visual-review status before opening a
+browser.
 
 ## Platform limits (enforced automatically)
 
@@ -195,6 +243,7 @@ The script reuses the `.session/tuchong` browser session. On the first run it wi
 metadata_contract.json # shared agent output contract
 metadata_core.py       # shared prompt, limits, validation, and persistence
 metadata_writer.py     # standard-library writer for native agent output
+metadata_contact_sheet.py # auditable preview and metadata contact sheets
 prepare_images.py      # temporary 1024px, metadata-free preview generator
 photo_desc.py          # optional standalone Anthropic API fallback
 requirements.txt       # preview and browser upload dependencies

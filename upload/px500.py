@@ -14,6 +14,7 @@ from pathlib import Path
 import json
 from typing import Optional
 
+from PIL import Image
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PWTimeout
 
 from .browser import ensure_logged_in
@@ -28,6 +29,7 @@ LOGIN_URL = (
 CONTRIBUTOR_BRIDGE_URL = (
     "https://500px.com.cn/page/contractPhotographer/index?type=0"
 )
+MIN_PIXEL_COUNT = 6_000_000
 
 
 def _has_logged_in_session(page: Page) -> bool:
@@ -70,7 +72,10 @@ def _community_session_ready(page: Page) -> bool:
     return (
         url.startswith("https://500px.com.cn/")
         and "/user/login" not in url
-        and page.locator("a[href*='/page/contractPhotographer/index']").count() > 0
+        and (
+            page.locator("a[href*='/page/contractPhotographer/index']").count() > 0
+            or page.locator("text=前往创作者中心").count() > 0
+        )
     )
 
 
@@ -84,9 +89,26 @@ def _enter_creator_studio(page: Page) -> bool:
     redirect_selector = (
         "a[href*='creatorstudio.500px.com.cn/api/redirect/index?access_token=']"
     )
+    redirect_link = page.locator(redirect_selector).first
+    if redirect_link.count() == 0:
+        creator_button = page.get_by_text("前往创作者中心", exact=True).first
+        try:
+            creator_button.wait_for(state="visible", timeout=60_000)
+            creator_button.click()
+            for _ in range(60):
+                for candidate in page.context.pages:
+                    try:
+                        if _has_logged_in_session(candidate):
+                            return True
+                    except Exception:
+                        continue
+                page.wait_for_timeout(1_000)
+        except PWTimeout:
+            return False
+        return False
+
     try:
-        page.wait_for_selector(redirect_selector, timeout=60_000)
-        redirect_url = page.locator(redirect_selector).first.get_attribute("href")
+        redirect_url = redirect_link.get_attribute("href")
         if not redirect_url:
             return False
         try:
@@ -133,6 +155,7 @@ _LOCATION_PATHS: list[tuple[list[str], list[str]]] = [
     (["加利福尼亚", "加州", "California"], ["美国", "加利福尼亚", "其他"]),
     (["盐湖城", "Salt Lake City", "SLC"], ["美国", "犹他", "其他"]),
     (["邦纳维尔", "Bonneville"], ["美国", "犹他", "其他"]),
+    (["怀俄明", "大提顿", "Grand Teton", "Wyoming"], ["美国", "怀俄明", "其他"]),
     (["纽约", "New York"], ["美国", "纽约", "纽约"]),
     (["西雅图", "Seattle"], ["美国", "华盛顿", "西雅图"]),
     (["拉斯维加斯", "Las Vegas"], ["美国", "内华达", "拉斯维加斯"]),
@@ -156,6 +179,24 @@ def _auto_review_reason(metadata: dict) -> str:
     if _resolve_path(location) is None:
         return f"unknown shooting location: {location or '(empty)'}"
     return ""
+
+
+def _resolution_review_reason(width: int, height: int) -> str:
+    pixel_count = width * height
+    if pixel_count <= MIN_PIXEL_COUNT:
+        return (
+            f"resolution is {width}x{height} ({pixel_count} pixels); "
+            f"500px requires more than {MIN_PIXEL_COUNT} pixels"
+        )
+    return ""
+
+
+def _image_review_reason(image: Path) -> str:
+    try:
+        with Image.open(image) as opened:
+            return _resolution_review_reason(opened.width, opened.height)
+    except OSError as error:
+        return f"could not inspect image dimensions: {error}"
 
 
 def _navigate_cascader(page: Page, path: list[str]) -> bool:
@@ -416,7 +457,7 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
     results = {img.name: UploadStatus.FAILED for img, _ in pairs}
     eligible_pairs = []
     for img, metadata in pairs:
-        reason = _auto_review_reason(metadata)
+        reason = _auto_review_reason(metadata) or _image_review_reason(img)
         if reason:
             print(f"  [review] 500px skipped {img.name}: {reason}", flush=True)
             results[img.name] = UploadStatus.NEEDS_REVIEW

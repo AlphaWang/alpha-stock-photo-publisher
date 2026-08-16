@@ -27,11 +27,18 @@ from upload.adobestock import upload_batch as upload_adobe_batch
 from upload.istock import _auto_review_reason as istock_review_reason
 from upload.px500 import _auto_review_reason as px500_review_reason
 from upload.px500 import _resolve_path
+from upload.px500 import _resolution_review_reason as px500_resolution_review_reason
 import upload.px500 as px500_module
 from upload.status import UploadStatus
 import upload.browser as browser_module
 from upload.confirmation import wait_for_success_text
-from upload.shutterstock import _has_logged_in_session as shutterstock_session_ready
+from upload.shutterstock import (
+    _asset_card_is_ready,
+    _canonical_category,
+    _keyword_count_from_text,
+    _validation_payload_is_ready,
+    _has_logged_in_session as shutterstock_session_ready,
+)
 from upload.tuchong import _login_page_session_ready as tuchong_login_ready
 from upload_photos import (
     _image_digest,
@@ -46,7 +53,57 @@ from upload_photos import _result_counts
 from cleanup_tuchong_drafts import DraftCard, _delete_card
 
 
+def complete_bound_metadata(image, *, include_hash=True, verified=True):
+    metadata = {
+        "source": image.name,
+        "title_en": "Sunlit mountain landscape",
+        "title_zh": "阳光下的山地景观",
+        "description_en": "A sunlit mountain rises above a green summer meadow.",
+        "description_zh": "阳光照亮山峰和绿色夏季草地。",
+        "keywords_en": [f"keyword-{index}" for index in range(20)],
+        "keywords_zh": [f"关键词{index}" for index in range(10)],
+        "category1": "Nature",
+        "category2": "Parks/Outdoor",
+        "location_zh": "",
+        "core_keywords_zh": [f"关键词{index}" for index in range(5)],
+        "commercial_uses_en": ["travel marketing"],
+        "release_status": "clear",
+        "release_notes": "",
+        "visual_review_status": "verified" if verified else "unreviewed",
+    }
+    if include_hash:
+        metadata["source_sha256"] = _image_digest(image)
+    return metadata
+
+
 class UploadLogicTests(unittest.TestCase):
+    def test_shutterstock_category_labels_are_canonicalized(self):
+        self.assertEqual(_canonical_category("Nature"), "Nature")
+        self.assertEqual(_canonical_category("自然"), "Nature")
+        self.assertEqual(_canonical_category("\u200b公园/户外\u200b"), "Parks/Outdoor")
+
+    def test_shutterstock_ready_card_supports_localized_status(self):
+        self.assertTrue(_asset_card_is_ready("DSC.jpg\nReady to submit"))
+        self.assertTrue(_asset_card_is_ready("DSC.jpg\n可提交"))
+        self.assertFalse(_asset_card_is_ready("DSC.jpg\nMissing information"))
+
+    def test_shutterstock_keyword_count_supports_localized_text(self):
+        self.assertEqual(_keyword_count_from_text("27/50 Keywords"), 27)
+        self.assertEqual(_keyword_count_from_text("7 / 50 关键词"), 7)
+        self.assertEqual(_keyword_count_from_text("Keywords"), 0)
+
+    def test_shutterstock_validation_requires_ready_media(self):
+        self.assertTrue(
+            _validation_payload_is_ready(
+                {"mediaStatus": [{"id": "1", "status": "ready"}]}
+            )
+        )
+        self.assertFalse(
+            _validation_payload_is_ready(
+                {"mediaStatus": [{"id": "1", "status": "needs_attention"}]}
+            )
+        )
+
     def test_adobe_original_filename_ignores_footer_actions(self):
         footer = (
             "File ID(s): 2151393607 - Original name(s): DSC01452.jpg"
@@ -122,6 +179,17 @@ class UploadLogicTests(unittest.TestCase):
         self.assertEqual(
             _resolve_path("美国犹他州邦纳维尔盐滩"), ["美国", "犹他", "其他"]
         )
+        self.assertEqual(
+            _resolve_path("美国怀俄明州大提顿国家公园"),
+            ["美国", "怀俄明", "其他"],
+        )
+
+    def test_500px_requires_more_than_six_megapixels(self):
+        self.assertIn(
+            "requires more than 6000000",
+            px500_resolution_review_reason(1701, 2552),
+        )
+        self.assertEqual(px500_resolution_review_reason(3001, 2000), "")
 
     def test_500px_creator_studio_uses_community_bridge(self):
         redirect_url = (
@@ -162,6 +230,22 @@ class UploadLogicTests(unittest.TestCase):
             page.urls,
             [px500_module.CONTRIBUTOR_BRIDGE_URL, redirect_url],
         )
+
+    def test_500px_recognizes_new_creator_center_button(self):
+        class Locator:
+            def __init__(self, count):
+                self._count = count
+
+            def count(self):
+                return self._count
+
+        class Page:
+            url = "https://500px.com.cn/community/index.html"
+
+            def locator(self, selector):
+                return Locator(1 if selector == "text=前往创作者中心" else 0)
+
+        self.assertTrue(px500_module._community_session_ready(Page()))
 
     def test_500px_detects_creator_studio_opened_in_new_tab(self):
         class Locator:
@@ -368,7 +452,7 @@ class UploadLogicTests(unittest.TestCase):
             image.write_bytes(bytes.fromhex(
                 "47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b"
             ))
-            metadata = {"source": image.name, "source_sha256": _image_digest(image)}
+            metadata = complete_bound_metadata(image)
             _validate_metadata_binding(image, metadata, False)
             image.write_bytes(bytes.fromhex(
                 "47494638396101000100800000ff0000ffffff21f90401000000002c00000000010001000002024401003b"
@@ -382,11 +466,37 @@ class UploadLogicTests(unittest.TestCase):
             image.write_bytes(bytes.fromhex(
                 "47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b"
             ))
-            metadata = {"source": image.name}
+            metadata = complete_bound_metadata(image, include_hash=False)
 
             with self.assertRaisesRegex(ValueError, "no source_sha256"):
                 _validate_metadata_binding(image, metadata, False)
             _validate_metadata_binding(image, metadata, True)
+
+    def test_unreviewed_metadata_is_blocked_by_default(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir) / "photo.jpg"
+            image.write_bytes(bytes.fromhex(
+                "47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b"
+            ))
+            metadata = complete_bound_metadata(image, verified=False)
+
+            with self.assertRaisesRegex(ValueError, "not visually verified"):
+                _validate_metadata_binding(image, metadata, False)
+            _validate_metadata_binding(image, metadata, False, True)
+
+    def test_thin_keywords_are_blocked_without_override(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir) / "photo.jpg"
+            image.write_bytes(bytes.fromhex(
+                "47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b"
+            ))
+            metadata = complete_bound_metadata(image)
+            metadata["keywords_en"] = metadata["keywords_en"][:5]
+            metadata["keywords_zh"] = metadata["keywords_zh"][:5]
+
+            with self.assertRaisesRegex(ValueError, "quality review required"):
+                _validate_metadata_binding(image, metadata, False)
+            _validate_metadata_binding(image, metadata, False, False, True)
 
     def test_find_pairs_keeps_same_stem_with_different_extensions(self):
         with tempfile.TemporaryDirectory() as temp_dir:

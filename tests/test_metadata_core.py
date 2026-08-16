@@ -8,7 +8,9 @@ from pathlib import Path
 from metadata_core import (
     assess_metadata_quality,
     enforce_limits,
+    find_batch_quality_issues,
     validate_metadata,
+    validate_metadata_quality,
     write_metadata,
 )
 
@@ -89,6 +91,44 @@ class MetadataCoreTests(unittest.TestCase):
         self.assertTrue(any("English keywords" in warning for warning in warnings))
         self.assertTrue(any("Chinese keywords" in warning for warning in warnings))
 
+    def test_quality_validation_rejects_generic_description_filler(self):
+        metadata = enforce_limits(sample_metadata())
+        metadata["description_en"] += " Presented as a wide view."
+
+        errors = validate_metadata_quality(metadata)
+
+        self.assertIn("description_en contains generic 'Presented as' filler", errors)
+
+    def test_quality_validation_rejects_clear_release_boilerplate(self):
+        metadata = enforce_limits(sample_metadata())
+        metadata["release_notes"] = "No recognizable people or logos are visible."
+
+        errors = validate_metadata_quality(metadata)
+
+        self.assertIn(
+            "release_notes must be empty when release_status is clear", errors
+        )
+
+    def test_quality_validation_requires_notes_for_unknown_release(self):
+        metadata = enforce_limits(sample_metadata())
+        metadata["release_status"] = "unknown"
+
+        self.assertIn(
+            "release_notes must explain required or unknown release status",
+            validate_metadata_quality(metadata),
+        )
+
+    def test_batch_quality_detects_repeated_metadata(self):
+        first = enforce_limits(sample_metadata())
+        second = enforce_limits(sample_metadata())
+
+        issues = find_batch_quality_issues(
+            [("one.jpg", first), ("two.jpg", second)]
+        )
+
+        self.assertIn("duplicate title_en shared by 2 images", issues["one.jpg"])
+        self.assertIn("duplicate description_en shared by 2 images", issues["two.jpg"])
+
     def test_write_metadata_adds_source_and_timestamp(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             directory = Path(temp_dir)
@@ -101,8 +141,29 @@ class MetadataCoreTests(unittest.TestCase):
             self.assertEqual(payload["source"], "road.jpg")
             self.assertTrue(payload["source_sha256"])
             self.assertTrue(payload["quality_warnings"])
+            self.assertEqual(payload["visual_review_status"], "unreviewed")
+            self.assertEqual(payload["visual_reviewed_at"], "")
             self.assertEqual(payload["category1"], "Transportation")
             self.assertTrue(payload["generated_at"])
+
+    def test_write_metadata_records_verified_review_provenance(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            image = directory / "road.jpg"
+            image.touch()
+
+            output = write_metadata(
+                sample_metadata(),
+                image,
+                directory,
+                visual_review_status="verified",
+                visual_review_method="manual",
+            )
+            payload = json.loads(output.read_text(encoding="utf-8"))
+
+            self.assertEqual(payload["visual_review_status"], "verified")
+            self.assertEqual(payload["visual_review_method"], "manual")
+            self.assertTrue(payload["visual_reviewed_at"])
 
     def test_manifest_writer_processes_multiple_images(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -111,11 +172,17 @@ class MetadataCoreTests(unittest.TestCase):
             for image in images:
                 image.touch()
             manifest = directory / "manifest.json"
+            first = sample_metadata()
+            second = sample_metadata()
+            second["title_en"] = "Mountain road beneath a clear sky"
+            second["description_en"] = (
+                "A mountain road curves beneath a clear blue summer sky."
+            )
             manifest.write_text(
                 json.dumps(
                     [
-                        {"image": str(image), "metadata": sample_metadata()}
-                        for image in images
+                        {"image": str(images[0]), "metadata": first},
+                        {"image": str(images[1]), "metadata": second},
                     ],
                     ensure_ascii=False,
                 ),

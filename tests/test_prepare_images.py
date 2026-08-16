@@ -1,9 +1,12 @@
 import importlib.util
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
+from metadata_contact_sheet import build_contact_sheets
 from prepare_images import cleanup_previews, prepare_previews
 
 
@@ -12,6 +15,23 @@ PIL_AVAILABLE = importlib.util.find_spec("PIL") is not None
 
 @unittest.skipUnless(PIL_AVAILABLE, "Pillow is not installed")
 class PrepareImagesTests(unittest.TestCase):
+    def complete_metadata(self):
+        return {
+            "title_en": "Blue mountain landscape under summer sky",
+            "title_zh": "夏日蓝天下的山地景观",
+            "description_en": "A blue mountain landscape rises beneath a clear summer sky.",
+            "description_zh": "蓝色山地景观延伸在晴朗夏日天空下。",
+            "keywords_en": [f"keyword-{index}" for index in range(20)],
+            "keywords_zh": [f"关键词{index}" for index in range(10)],
+            "category1": "Nature",
+            "category2": "Parks/Outdoor",
+            "location_zh": "",
+            "core_keywords_zh": [f"关键词{index}" for index in range(5)],
+            "commercial_uses_en": ["travel marketing"],
+            "release_status": "clear",
+            "release_notes": "",
+        }
+
     def test_prepare_and_cleanup_preview(self):
         from PIL import Image
 
@@ -62,6 +82,156 @@ class PrepareImagesTests(unittest.TestCase):
                 self.assertEqual(image.size, (800, 400))
                 self.assertFalse(image.getexif())
             cleanup_previews(manifest)
+
+    def test_contact_sheet_receipt_binds_metadata_manifest(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "landscape.jpg"
+            Image.new("RGB", (800, 500), "blue").save(source)
+            preview_manifest, _ = prepare_previews(source)
+            metadata_manifest = Path(temp_dir) / "metadata.json"
+            metadata_manifest.write_text(
+                json.dumps(
+                    [
+                        {
+                            "image": str(source),
+                            "metadata": {
+                                "title_en": "Blue mountain landscape",
+                                "description_en": "A blue mountain landscape under clear sky.",
+                            },
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            receipt_path = build_contact_sheets(
+                preview_manifest, metadata_manifest
+            )
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(receipt["source_count"], 1)
+            self.assertEqual(len(receipt["sheets"]), 1)
+            self.assertTrue(Path(receipt["sheets"][0]).is_file())
+            self.assertIn(receipt["sheets"][0], receipt["sheet_sha256"])
+            cleanup_previews(preview_manifest)
+
+    def test_writer_accepts_matching_agent_audit_receipt(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            source = directory / "landscape.jpg"
+            Image.new("RGB", (800, 500), "blue").save(source)
+            preview_manifest, _ = prepare_previews(source)
+            metadata_manifest = directory / "metadata.json"
+            metadata_manifest.write_text(
+                json.dumps(
+                    [{"image": str(source), "metadata": self.complete_metadata()}]
+                ),
+                encoding="utf-8",
+            )
+            receipt = build_contact_sheets(preview_manifest, metadata_manifest)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).parents[1] / "metadata_writer.py"),
+                    "--manifest",
+                    str(metadata_manifest),
+                    "--strict-quality",
+                    "--visual-reviewed",
+                    "--review-method",
+                    "agent-native",
+                    "--audit-receipt",
+                    str(receipt),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = next(directory.glob("landscape.jpg_*.json"))
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["visual_review_status"], "verified")
+            cleanup_previews(preview_manifest)
+
+    def test_writer_rejects_receipt_after_manifest_changes(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            source = directory / "landscape.jpg"
+            Image.new("RGB", (800, 500), "blue").save(source)
+            preview_manifest, _ = prepare_previews(source)
+            metadata_manifest = directory / "metadata.json"
+            metadata_manifest.write_text(
+                json.dumps(
+                    [{"image": str(source), "metadata": self.complete_metadata()}]
+                ),
+                encoding="utf-8",
+            )
+            receipt = build_contact_sheets(preview_manifest, metadata_manifest)
+            metadata_manifest.write_text("[]", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).parents[1] / "metadata_writer.py"),
+                    "--manifest",
+                    str(metadata_manifest),
+                    "--visual-reviewed",
+                    "--audit-receipt",
+                    str(receipt),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("does not match", result.stderr)
+            cleanup_previews(preview_manifest)
+
+    def test_writer_rejects_changed_contact_sheet(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            source = directory / "landscape.jpg"
+            Image.new("RGB", (800, 500), "blue").save(source)
+            preview_manifest, _ = prepare_previews(source)
+            metadata_manifest = directory / "metadata.json"
+            metadata_manifest.write_text(
+                json.dumps(
+                    [{"image": str(source), "metadata": self.complete_metadata()}]
+                ),
+                encoding="utf-8",
+            )
+            receipt = build_contact_sheets(preview_manifest, metadata_manifest)
+            receipt_data = json.loads(receipt.read_text(encoding="utf-8"))
+            Path(receipt_data["sheets"][0]).write_bytes(b"changed")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).parents[1] / "metadata_writer.py"),
+                    "--manifest",
+                    str(metadata_manifest),
+                    "--visual-reviewed",
+                    "--audit-receipt",
+                    str(receipt),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("contact sheets have changed", result.stderr)
+            cleanup_previews(preview_manifest)
 
 
 if __name__ == "__main__":

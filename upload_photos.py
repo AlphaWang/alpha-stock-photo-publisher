@@ -15,7 +15,14 @@ import json
 import sys
 from pathlib import Path
 
-from metadata_core import image_sha256
+from metadata_core import (
+    assess_metadata_quality,
+    enforce_limits,
+    find_batch_quality_issues,
+    image_sha256,
+    validate_metadata,
+    validate_metadata_quality,
+)
 from upload.status import UploadStatus
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
@@ -97,7 +104,13 @@ def _history_entry_completed(entry: object) -> bool:
         return False
 
 
-def _validate_metadata_binding(image: Path, metadata: dict, allow_unbound: bool) -> None:
+def _validate_metadata_binding(
+    image: Path,
+    metadata: dict,
+    allow_unbound: bool,
+    allow_unreviewed: bool = False,
+    allow_quality_warnings: bool = False,
+) -> None:
     if image.stat().st_size <= 0:
         raise ValueError("image file is empty")
     try:
@@ -113,12 +126,28 @@ def _validate_metadata_binding(image: Path, metadata: dict, allow_unbound: bool)
         raise ValueError(f"metadata source is {source!r}, expected {image.name!r}")
     expected_digest = metadata.get("source_sha256")
     if not expected_digest:
-        if allow_unbound:
-            return
-        raise ValueError("metadata has no source_sha256; regenerate it or use --allow-unbound-metadata")
-    actual_digest = _image_digest(image)
-    if expected_digest != actual_digest:
-        raise ValueError("image content changed after metadata generation")
+        if not allow_unbound:
+            raise ValueError(
+                "metadata has no source_sha256; regenerate it or use "
+                "--allow-unbound-metadata"
+            )
+    else:
+        actual_digest = _image_digest(image)
+        if expected_digest != actual_digest:
+            raise ValueError("image content changed after metadata generation")
+
+    normalized = enforce_limits(metadata)
+    errors = validate_metadata(normalized) + validate_metadata_quality(normalized)
+    if errors:
+        raise ValueError("; ".join(errors))
+    warnings = assess_metadata_quality(normalized)
+    if warnings and not allow_quality_warnings:
+        raise ValueError("quality review required: " + "; ".join(warnings))
+    if metadata.get("visual_review_status") != "verified" and not allow_unreviewed:
+        raise ValueError(
+            "metadata is not visually verified; regenerate/review it or use "
+            "--allow-unreviewed-metadata"
+        )
 
 
 # Max images per single upload session per platform (platform UI limits)
@@ -174,6 +203,9 @@ def run_upload(
     *,
     force: bool = False,
     allow_unbound_metadata: bool = False,
+    allow_unreviewed_metadata: bool = False,
+    allow_quality_warnings: bool = False,
+    allow_repeated_metadata: bool = False,
 ) -> bool:
     from playwright.sync_api import sync_playwright
     import upload.px500 as _px500
@@ -198,11 +230,30 @@ def run_upload(
                 continue
             try:
                 metadata = load_metadata(json_path)
-                _validate_metadata_binding(img, metadata, allow_unbound_metadata)
+                _validate_metadata_binding(
+                    img,
+                    metadata,
+                    allow_unbound_metadata,
+                    allow_unreviewed_metadata,
+                    allow_quality_warnings,
+                )
                 loaded.append((img, metadata))
             except (OSError, ValueError, json.JSONDecodeError) as error:
                 print(f"  [review] {img.name}: {error}", flush=True)
                 preflight_results[img.name] = UploadStatus.NEEDS_REVIEW
+        repeated = find_batch_quality_issues(
+            [(image.name, metadata) for image, metadata in loaded]
+        )
+        if repeated and not allow_repeated_metadata:
+            blocked = set(repeated)
+            for filename, issues in sorted(repeated.items()):
+                print(
+                    f"  [review] {filename}: " + "; ".join(issues),
+                    flush=True,
+                )
+                preflight_results[filename] = UploadStatus.NEEDS_REVIEW
+            loaded = [(image, metadata) for image, metadata in loaded if image.name not in blocked]
+
         skipped_by_platform[platform_key] = skipped
         preflight_by_platform[platform_key] = preflight_results
         if skipped:
@@ -324,6 +375,21 @@ def main() -> int:
         action="store_true",
         help="Allow legacy JSON files without source_sha256 (source name is still checked)",
     )
+    parser.add_argument(
+        "--allow-unreviewed-metadata",
+        action="store_true",
+        help="Allow metadata without visual_review_status=verified",
+    )
+    parser.add_argument(
+        "--allow-quality-warnings",
+        action="store_true",
+        help="Allow metadata with non-blocking discovery-quality warnings",
+    )
+    parser.add_argument(
+        "--allow-repeated-metadata",
+        action="store_true",
+        help="Allow repeated titles/descriptions after explicit review",
+    )
     args = parser.parse_args()
 
     target = Path(args.directory).expanduser().resolve()
@@ -355,6 +421,9 @@ def main() -> int:
         args.platform,
         force=args.force,
         allow_unbound_metadata=args.allow_unbound_metadata,
+        allow_unreviewed_metadata=args.allow_unreviewed_metadata,
+        allow_quality_warnings=args.allow_quality_warnings,
+        allow_repeated_metadata=args.allow_repeated_metadata,
     ) else 1
 
 

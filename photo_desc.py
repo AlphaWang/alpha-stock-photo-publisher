@@ -29,7 +29,11 @@ from metadata_core import (
     SHUTTERSTOCK_KW_MAX,
     SUPPORTED_EXTS,
     SYSTEM_PROMPT,
+    assess_metadata_quality,
     enforce_limits,
+    find_batch_quality_issues,
+    validate_metadata,
+    validate_metadata_quality,
     write_metadata,
 )
 
@@ -93,8 +97,10 @@ def get_model() -> str:
     return os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 
-def load_image(path: Path) -> tuple[str, str]:
-    """Resize to 1024px on the long edge and encode as JPEG for the API."""
+def load_image(
+    path: Path, *, max_edge: int = 1024, quality: int = 70
+) -> tuple[str, str]:
+    """Resize and encode an EXIF-corrected JPEG for the API."""
     try:
         from PIL import Image, ImageOps
     except ImportError:
@@ -115,16 +121,42 @@ def load_image(path: Path) -> tuple[str, str]:
         else:
             img = img.convert("RGB")
         resampling = getattr(Image, "Resampling", Image).LANCZOS
-        img.thumbnail((1024, 1024), resampling)
+        img.thumbnail((max_edge, max_edge), resampling)
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=70, optimize=True)
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
     return base64.standard_b64encode(buf.getvalue()).decode(), "image/jpeg"
 
 
-def analyze_image(image_path: Path, client, context: str = "") -> dict:
+def _json_from_response(response) -> dict:
+    raw = next(block.text for block in response.content if block.type == "text")
+    raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+    raw = re.sub(r"\s*```$", "", raw)
+    result = json.loads(raw)
+    if not isinstance(result, dict):
+        raise ValueError("model response must be a JSON object")
+    return result
+
+
+def analyze_image(
+    image_path: Path,
+    client,
+    context: str = "",
+    revision_feedback: str = "",
+) -> dict:
     data, media_type = load_image(image_path)
 
-    context_note = f"\n\nShooting context (use this to improve description accuracy and keyword commercial value): {context}" if context else ""
+    context_note = (
+        "\n\nShooting context (supporting location information only; never treat "
+        f"it as proof that a subject is visible): {context}"
+        if context
+        else ""
+    )
+    revision_note = (
+        "\n\nA visual verifier rejected the previous draft. Correct every issue "
+        f"listed here: {revision_feedback}"
+        if revision_feedback
+        else ""
+    )
 
     last_error = None
     for attempt in range(3):
@@ -154,6 +186,7 @@ def analyze_image(image_path: Path, client, context: str = "") -> dict:
                                     f"keywords_zh: up to {PX500_KW_MAX} Chinese keywords. "
                                     f"description_zh: max {PX500_DESC_MAX} characters."
                                     + context_note
+                                    + revision_note
                                 ),
                             },
                         ],
@@ -161,10 +194,7 @@ def analyze_image(image_path: Path, client, context: str = "") -> dict:
                 ],
             )
 
-            raw = next(block.text for block in response.content if block.type == "text")
-            raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
-            raw = re.sub(r"\s*```$", "", raw)
-            return json.loads(raw)
+            return _json_from_response(response)
         except Exception as error:
             last_error = error
             if attempt < 2:
@@ -172,13 +202,128 @@ def analyze_image(image_path: Path, client, context: str = "") -> dict:
     raise RuntimeError(f"metadata API failed after 3 attempts: {last_error}")
 
 
-def process_one(image_path: Path, output_dir: Path, client, context: str = "") -> tuple[Path, bool, str]:
+def verify_metadata(
+    image_path: Path, metadata: dict, client, context: str = ""
+) -> tuple[bool, list[str]]:
+    """Run an independent visual-grounding pass at a higher preview resolution."""
+    data, media_type = load_image(image_path, max_edge=1536, quality=78)
+    context_note = (
+        "\nShooting context may establish location only: " + context if context else ""
+    )
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = client.messages.create(
+                model=get_model(),
+                max_tokens=1024,
+                system=(
+                    "You are an independent stock-photo metadata verifier. Compare the "
+                    "proposed metadata against this image only. Check every concrete "
+                    "subject, action, water body, landform, structure, person, text/logo, "
+                    "landmark, weather claim, keyword, and release risk. A path or "
+                    "shooting context can support location but cannot prove that a subject "
+                    "is visible. Fail material omissions of the primary commercial subject "
+                    "or any invented visual claim. Return strict JSON only as "
+                    "{\"verdict\":\"pass\",\"issues\":[]} or "
+                    "{\"verdict\":\"fail\",\"issues\":[\"specific correction\"]}."
+                ),
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": media_type,
+                                    "data": data,
+                                },
+                            },
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Verify this proposed metadata:\n"
+                                    + json.dumps(metadata, ensure_ascii=False)
+                                    + context_note
+                                ),
+                            },
+                        ],
+                    }
+                ],
+            )
+            result = _json_from_response(response)
+            break
+        except Exception as error:
+            last_error = error
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    else:
+        raise RuntimeError(
+            f"visual metadata verifier failed after 3 attempts: {last_error}"
+        )
+    verdict = str(result.get("verdict", "")).strip().lower()
+    issues = result.get("issues", [])
+    if not isinstance(issues, list):
+        raise ValueError("visual verifier issues must be an array")
+    issues = [str(issue).strip() for issue in issues if str(issue).strip()]
+    if verdict not in {"pass", "fail"}:
+        raise ValueError("visual verifier verdict must be pass or fail")
+    if verdict == "fail" and not issues:
+        issues = ["visual verifier rejected the metadata without details"]
+    return verdict == "pass", issues
+
+
+def generate_one(
+    image_path: Path, client, context: str = ""
+) -> tuple[Path, bool, object]:
     try:
         result = enforce_limits(analyze_image(image_path, client, context))
-        out_file = write_metadata(result, image_path, output_dir)
+        for review_attempt in range(2):
+            static_issues = (
+                validate_metadata(result)
+                + validate_metadata_quality(result)
+                + assess_metadata_quality(result)
+            )
+            if static_issues:
+                passed, issues = False, static_issues
+            else:
+                passed, issues = verify_metadata(image_path, result, client, context)
+            if passed:
+                break
+            if review_attempt == 1:
+                raise RuntimeError(
+                    "visual metadata verification failed: " + "; ".join(issues)
+                )
+            result = enforce_limits(
+                analyze_image(
+                    image_path,
+                    client,
+                    context,
+                    revision_feedback="; ".join(issues),
+                )
+            )
+        return image_path, True, result
+    except Exception as error:
+        return image_path, False, str(error)
+
+
+def process_one(
+    image_path: Path, output_dir: Path, client, context: str = ""
+) -> tuple[Path, bool, str]:
+    image_path, ok, result = generate_one(image_path, client, context)
+    if not ok:
+        return image_path, False, str(result)
+    try:
+        out_file = write_metadata(
+            result,
+            image_path,
+            output_dir,
+            visual_review_status="verified",
+            visual_review_method="anthropic-second-pass",
+        )
         return image_path, True, str(out_file)
-    except Exception as e:
-        return image_path, False, str(e)
+    except Exception as error:
+        return image_path, False, str(error)
 
 
 def collect_images(target: Path) -> list[Path]:
@@ -235,16 +380,45 @@ def main() -> int:
 
     done = 0
     failed = []
+    generated = []
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(process_one, img, output_for(img), client, args.context): img for img in images}
+        futures = {
+            executor.submit(generate_one, img, client, args.context): img
+            for img in images
+        }
         for future in as_completed(futures):
-            img, ok, info = future.result()
+            img, ok, result = future.result()
             done += 1
             if ok:
-                print(f"[{done}/{total}] ✓ {img.name} → {Path(info).name}")
+                generated.append((img, result))
+                print(f"[{done}/{total}] verified {img.name}")
             else:
                 failed.append(img.name)
-                print(f"[{done}/{total}] ✗ {img.name} failed: {info}")
+                print(f"[{done}/{total}] failed {img.name}: {result}")
+
+    repeated = find_batch_quality_issues(
+        [(str(image), metadata) for image, metadata in generated]
+    )
+    for image, metadata in generated:
+        if str(image) in repeated:
+            failed.append(image.name)
+            print(
+                f"[batch] failed {image.name}: "
+                + "; ".join(repeated[str(image)])
+            )
+            continue
+        try:
+            out_file = write_metadata(
+                metadata,
+                image,
+                output_for(image),
+                visual_review_status="verified",
+                visual_review_method="anthropic-second-pass",
+            )
+            print(f"wrote {image.name} -> {out_file.name}")
+        except Exception as error:
+            failed.append(image.name)
+            print(f"failed {image.name} during write: {error}")
 
     print(f"\nDone: {total - len(failed)}/{total} succeeded")
     if failed:

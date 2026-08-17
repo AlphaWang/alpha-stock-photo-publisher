@@ -7,6 +7,8 @@ import json
 import textwrap
 from pathlib import Path
 
+from metadata_core import METADATA_FIELDS
+
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -22,6 +24,68 @@ def _load_pillow():
     except ImportError as error:
         raise RuntimeError("Pillow is required: pip install pillow") from error
     return Image, ImageDraw, ImageFont
+
+
+def _audit_font(ImageFont):
+    candidates = (
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    )
+    for candidate in candidates:
+        if Path(candidate).is_file():
+            try:
+                return ImageFont.truetype(candidate, 14)
+            except OSError:
+                continue
+    return ImageFont.load_default()
+
+
+def _wrapped(label: str, value: object, *, width: int = 132) -> list[str]:
+    if isinstance(value, list):
+        text = ", ".join(str(item) for item in value)
+    elif isinstance(value, dict):
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    else:
+        text = str(value or "")
+    return textwrap.wrap(
+        f"{label}: {text or '(empty)'}",
+        width=width,
+        break_long_words=False,
+        break_on_hyphens=False,
+    ) or [f"{label}: (empty)"]
+
+
+def _metadata_lines(source: Path, metadata: dict) -> list[str]:
+    lines = [source.name]
+    fields = (
+        ("Title EN", "title_en"),
+        ("Title ZH", "title_zh"),
+        ("Description EN", "description_en"),
+        ("Description ZH", "description_zh"),
+        ("Keywords EN (all)", "keywords_en"),
+        ("Keywords ZH (all)", "keywords_zh"),
+        ("Shutterstock category 1", "category1"),
+        ("Shutterstock category 2", "category2"),
+        ("Platform categories", "platform_categories"),
+        ("Location EN", "location_en"),
+        ("Location ZH", "location_zh"),
+        ("Location source", "location_source"),
+        ("Location confidence", "location_confidence"),
+        ("Core keywords ZH", "core_keywords_zh"),
+        ("Commercial uses", "commercial_uses_en"),
+        ("Model release", "model_release_status"),
+        ("Property release", "property_release_status"),
+        ("Logo/trademark", "logo_trademark_status"),
+        ("Copyrighted content", "copyrighted_content_status"),
+        ("Commercial eligibility", "commercial_eligibility"),
+        ("Release summary", "release_status"),
+        ("Release notes", "release_notes"),
+    )
+    for label, field in fields:
+        lines.extend(_wrapped(label, metadata.get(field)))
+    return lines
 
 
 def _resolve_path(value: object, base: Path) -> Path:
@@ -88,47 +152,42 @@ def build_contact_sheets(preview_manifest: Path, metadata_manifest: Path) -> Pat
     metadata_digest = _sha256(metadata_manifest)
     output_dir = preview_manifest.parent / f"metadata-audit-{metadata_digest[:12]}"
     output_dir.mkdir(exist_ok=True)
-    font = ImageFont.load_default()
+    font = _audit_font(ImageFont)
     sheet_paths = []
-    columns, rows = 3, 3
-    cell_width, cell_height = 420, 460
+    # One image per sheet leaves enough room to display every keyword and all
+    # bilingual/risk fields without silently clipping the audit evidence.
+    columns, rows = 1, 1
+    cell_width, cell_height = 1200, 1600
     per_sheet = columns * rows
 
     for page, start in enumerate(range(0, len(records), per_sheet), 1):
+        page_records = records[start : start + per_sheet]
+        line_count = max(
+            len(_metadata_lines(source, metadata))
+            for source, _preview, metadata in page_records
+        )
+        rendered_height = max(cell_height, 710 + line_count * 18)
         sheet = Image.new(
-            "RGB", (columns * cell_width, rows * cell_height), "white"
+            "RGB", (columns * cell_width, rows * rendered_height), "white"
         )
         draw = ImageDraw.Draw(sheet)
         for offset, (source, preview, metadata) in enumerate(
-            records[start : start + per_sheet]
+            page_records
         ):
             row, column = divmod(offset, columns)
-            x, y = column * cell_width, row * cell_height
+            x, y = column * cell_width, row * rendered_height
             with Image.open(preview) as opened:
                 image = opened.convert("RGB")
-                image.thumbnail((400, 260))
-                sheet.paste(image, (x + (400 - image.width) // 2 + 10, y + 5))
-            title = str(metadata.get("title_en", "NO TITLE"))
-            description = str(metadata.get("description_en", "NO DESCRIPTION"))
-            keywords = metadata.get("keywords_en", [])
-            if not isinstance(keywords, list):
-                keywords = []
-            keyword_text = ", ".join(str(keyword) for keyword in keywords[:15])
-            release_status = str(metadata.get("release_status", "unknown"))
-            release_notes = str(metadata.get("release_notes", ""))
-            label = "\n".join(
-                [
-                    source.name,
-                    *textwrap.wrap(title, width=44)[:2],
-                    *textwrap.wrap(description, width=48)[:3],
-                    *textwrap.wrap("KW: " + keyword_text, width=52)[:3],
-                    *textwrap.wrap(
-                        f"Release: {release_status} {release_notes}".strip(),
-                        width=52,
-                    )[:2],
-                ]
+                image.thumbnail((1160, 650))
+                sheet.paste(image, (x + (1160 - image.width) // 2 + 20, y + 5))
+            label = "\n".join(_metadata_lines(source, metadata))
+            draw.multiline_text(
+                (x + 18, y + 670),
+                label,
+                fill="black",
+                font=font,
+                spacing=2,
             )
-            draw.multiline_text((x + 6, y + 272), label, fill="black", font=font)
         sheet_path = output_dir / f"metadata-audit-{page:03d}.jpg"
         sheet.save(sheet_path, "JPEG", quality=90)
         sheet_paths.append(str(sheet_path))
@@ -143,6 +202,8 @@ def build_contact_sheets(preview_manifest: Path, metadata_manifest: Path) -> Pat
                 "metadata_manifest": str(metadata_manifest),
                 "metadata_manifest_sha256": metadata_digest,
                 "source_count": len(records),
+                "audit_schema_version": 2,
+                "audited_fields": list(METADATA_FIELDS),
                 "sheets": sheet_paths,
                 "sheet_sha256": {
                     sheet_path: _sha256(Path(sheet_path)) for sheet_path in sheet_paths

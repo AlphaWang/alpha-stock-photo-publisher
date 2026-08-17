@@ -21,12 +21,21 @@ class PrepareImagesTests(unittest.TestCase):
             "title_zh": "夏日蓝天下的山地景观",
             "description_en": "A blue mountain landscape rises beneath a clear summer sky.",
             "description_zh": "蓝色山地景观延伸在晴朗夏日天空下。",
-            "keywords_en": [f"keyword-{index}" for index in range(20)],
-            "keywords_zh": [f"关键词{index}" for index in range(10)],
+            "keywords_en": [
+                "mountain", "blue sky", "landscape", "sunlight", "outdoors",
+                "nature", "scenic", "wilderness", "alpine", "grassland",
+                "daylight", "tranquil", "travel destination", "natural beauty",
+                "copy space", "horizontal", "environment", "rural", "panoramic",
+                "summer",
+            ],
+            "keywords_zh": [
+                "山峰", "蓝天", "风景", "阳光", "户外",
+                "自然", "高山", "宁静", "旅行", "夏季",
+            ],
             "category1": "Nature",
             "category2": "Parks/Outdoor",
             "location_zh": "",
-            "core_keywords_zh": [f"关键词{index}" for index in range(5)],
+            "core_keywords_zh": ["山峰", "蓝天", "风景", "阳光", "户外"],
             "commercial_uses_en": ["travel marketing"],
             "release_status": "clear",
             "release_notes": "",
@@ -112,6 +121,8 @@ class PrepareImagesTests(unittest.TestCase):
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
 
             self.assertEqual(receipt["source_count"], 1)
+            self.assertEqual(receipt["audit_schema_version"], 2)
+            self.assertIn("keywords_zh", receipt["audited_fields"])
             self.assertEqual(len(receipt["sheets"]), 1)
             self.assertTrue(Path(receipt["sheets"][0]).is_file())
             self.assertIn(receipt["sheets"][0], receipt["sheet_sha256"])

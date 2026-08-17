@@ -73,7 +73,7 @@ Open this project in [Claude Code](https://claude.ai/code) and run:
 Both agent skills follow the same workflow:
 
 1. Create temporary 1024px previews and generate per-image visual facts and metadata
-2. Build filename-and-metadata contact sheets and inspect every proposed description
+2. Build one-image audit sheets showing every English/Chinese field and keyword
 3. Run strict batch validation, then write SHA-bound metadata marked as visually verified
 4. Remove the previews and audit sheets
 5. Upload only when explicitly requested, with another quality and review-status preflight
@@ -94,8 +94,9 @@ python3 photo_desc.py /path/to/dir --context "SLC road trip"
 ```
 
 This path requires the optional Anthropic dependencies and credentials above. It
-uses a 1024px generation preview followed by an independent 1536px visual
-verification pass. A rejected draft is regenerated once, and the completed batch
+uses a 1024px generation preview followed by a context-isolated 1536px visual
+verification pass with overlapping crops for small text, logos, and people. Set
+`ANTHROPIC_VERIFIER_MODEL` to use a separately configured verifier model. A rejected draft is regenerated once, and the completed batch
 is checked for repeated titles and descriptions before any repeated records are
 written. Metadata is not written when the second verification still fails. This
 path is not used by the normal Codex or Claude native workflow.
@@ -120,8 +121,9 @@ python3 metadata_contact_sheet.py \
   --metadata-manifest /tmp/proposed-metadata.json
 ```
 
-Inspect every reported sheet, including its displayed English keywords and
-release status/notes, then use its receipt to write verified metadata:
+Inspect every reported sheet. Each sheet contains one image plus every bilingual
+title, description, keyword, platform category, location-evidence field, commercial
+use, and release/IP field. Then use its receipt to write verified metadata:
 
 ```bash
 python3 metadata_writer.py \
@@ -133,9 +135,27 @@ python3 metadata_writer.py \
 ```
 
 The writer validates the entire manifest before writing any file. Repeated titles
-or descriptions, repeated factual leads, generic filler, release-status
-contradictions, thin strict-mode keyword sets, and changed or mismatched audit
-artifacts block the batch.
+or descriptions, repeated factual leads, generic filler, irrelevant first keywords,
+word-stem spam, unsupported locations, release-status contradictions, invalid
+platform categories, and changed or incomplete audit artifacts block the batch.
+Counts below 15 English or 8 Chinese keywords are advisory only; never pad metadata
+with weak terms to silence an advisory.
+
+### Run a labeled metadata benchmark
+
+Use `metadata_benchmark.py` to compare a generated manifest against human labels:
+
+```bash
+python3 metadata_benchmark.py \
+  --expected /path/to/golden-labels.json \
+  --actual /path/to/proposed-metadata.json
+```
+
+Each expected item uses the same `image` value and an `expected` object containing
+any of `required_terms_en`, `forbidden_terms_en`, `required_terms_zh`,
+`forbidden_terms_zh`, `first10_terms_en`, `category1`, and the structured
+release/IP fields. The command reports per-image failures and an aggregate pass
+rate, so prompt or model changes can be measured on real labeled photos.
 
 ### Upload manually
 
@@ -155,10 +175,10 @@ result is recorded to prevent duplicate transfer but returns a nonzero exit stat
 until metadata is confirmed saved. Legacy JSON
 without a source hash is blocked by default; use `--allow-unbound-metadata` only
 for trusted older metadata that cannot be regenerated.
-Unreviewed metadata, quality warnings, and repeated batch copy are also blocked by
-default. `--allow-unreviewed-metadata`, `--allow-quality-warnings`, and
-`--allow-repeated-metadata` are explicit manual overrides and should not be used
-by the normal skill workflow.
+Unreviewed metadata, factual/ordering/spam defects, commercial release risks, and
+repeated batch copy are blocked by default. Keyword-count advisories do not block
+upload. `--allow-unreviewed-metadata` and `--allow-repeated-metadata` are explicit
+manual overrides and should not be used by the normal skill workflow.
 
 ## First run (browser login)
 
@@ -186,9 +206,23 @@ Each image produces a timestamped JSON file alongside it, e.g. `DSC00012.jpg_202
   "keywords_zh": ["...", "..."],
   "category1": "Nature",
   "category2": "Parks/Outdoor",
+  "platform_categories": {
+    "shutterstock": ["Nature", "Parks/Outdoor"],
+    "adobestock": "Landscapes",
+    "tuchong": ["自然风光"],
+    "istock": "Nature"
+  },
+  "location_en": "",
   "location_zh": "",
+  "location_source": "unknown",
+  "location_confidence": "unknown",
   "core_keywords_zh": ["..."],
   "commercial_uses_en": ["travel marketing"],
+  "model_release_status": "not_required",
+  "property_release_status": "not_required",
+  "logo_trademark_status": "none",
+  "copyrighted_content_status": "none",
+  "commercial_eligibility": "clear",
   "release_status": "clear",
   "release_notes": ""
 }
@@ -196,8 +230,8 @@ Each image produces a timestamped JSON file alongside it, e.g. `DSC00012.jpg_202
 
 If you run metadata generation on the same image twice, the newest JSON is used
 automatically. Upload verifies the exact filename, SHA-256, metadata contract,
-quality warnings, batch uniqueness, and visual-review status before opening a
-browser.
+critical quality rules, commercial eligibility, batch uniqueness, and visual-review
+status before opening a browser.
 
 ## Platform limits (enforced automatically)
 

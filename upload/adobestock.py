@@ -23,6 +23,7 @@ from playwright.sync_api import BrowserContext, Page, TimeoutError as PWTimeout
 from .browser import ensure_logged_in
 from .confirmation import wait_for_success_text
 from .status import UploadStatus
+from metadata_core import commercial_submission_review_reason, platform_category
 
 PORTAL_URL = "https://contributor.stock.adobe.com/"
 LOGIN_URL = PORTAL_URL
@@ -64,19 +65,23 @@ def _resolve_category(category1: str) -> Optional[str]:
     return None
 
 
+def _category_for_metadata(meta: dict) -> Optional[str]:
+    explicit = platform_category(meta, "adobestock")
+    if explicit:
+        return str(explicit)
+    return _resolve_category(str(meta.get("category1", "")))
+
+
 def _auto_review_reason(meta: dict) -> str:
     if not str(meta.get("title_en", "")).strip():
         return "title is empty"
     keyword_count = len(meta.get("keywords_en", [])[:49])
     if keyword_count < 5:
         return f"only {keyword_count} keywords (min 5 required)"
-    release_notes = str(meta.get("release_notes", "")).strip()
-    release_status = str(meta.get("release_status", "unknown")).strip().lower()
-    if release_status != "clear":
-        return f"release status is {release_status or 'unknown'}"
-    if release_notes:
-        return f"release review required — {release_notes}"
-    if _resolve_category(str(meta.get("category1", ""))) is None:
+    commercial_reason = commercial_submission_review_reason(meta)
+    if commercial_reason:
+        return commercial_reason
+    if _category_for_metadata(meta) is None:
         return "category cannot be mapped to Adobe Stock"
     return ""
 
@@ -194,19 +199,15 @@ def _fill_metadata(page: Page, img: Path, meta: dict) -> bool:
     # Title — data-t="asset-title-content-tagger", max 200 chars
     title = meta.get("title_en", "")[:200]
     keywords = meta.get("keywords_en", [])[:49]
-    release_notes = str(meta.get("release_notes", "")).strip()
-    release_status = str(meta.get("release_status", "unknown")).strip().lower()
     if not title:
         print(f"  [review] {img.name}: title is empty")
         return False
     if len(keywords) < 5:
         print(f"  [review] {img.name}: only {len(keywords)} keywords (min 5 required)")
         return False
-    if release_status != "clear":
-        print(f"  [review] {img.name}: release status is {release_status or 'unknown'}")
-        return False
-    if release_notes:
-        print(f"  [review] {img.name}: release review required — {release_notes}")
+    commercial_reason = commercial_submission_review_reason(meta)
+    if commercial_reason:
+        print(f"  [review] {img.name}: {commercial_reason}")
         return False
 
     try:
@@ -254,7 +255,7 @@ def _fill_metadata(page: Page, img: Path, meta: dict) -> bool:
         return False
 
     # Category — try hidden native <select> first (force), fall back to Spectrum FieldButton
-    category = _resolve_category(meta.get("category1", ""))
+    category = _category_for_metadata(meta)
     if category is None:
         print(f"  [review] {img.name}: category cannot be mapped to Adobe Stock")
         return False

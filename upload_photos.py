@@ -16,7 +16,6 @@ import sys
 from pathlib import Path
 
 from metadata_core import (
-    assess_metadata_quality,
     enforce_limits,
     find_batch_quality_issues,
     image_sha256,
@@ -110,7 +109,8 @@ def _validate_metadata_binding(
     allow_unbound: bool,
     allow_unreviewed: bool = False,
     allow_quality_warnings: bool = False,
-) -> None:
+) -> dict:
+    _ = allow_quality_warnings  # retained for CLI compatibility; advisories never block
     if image.stat().st_size <= 0:
         raise ValueError("image file is empty")
     try:
@@ -140,14 +140,12 @@ def _validate_metadata_binding(
     errors = validate_metadata(normalized) + validate_metadata_quality(normalized)
     if errors:
         raise ValueError("; ".join(errors))
-    warnings = assess_metadata_quality(normalized)
-    if warnings and not allow_quality_warnings:
-        raise ValueError("quality review required: " + "; ".join(warnings))
     if metadata.get("visual_review_status") != "verified" and not allow_unreviewed:
         raise ValueError(
             "metadata is not visually verified; regenerate/review it or use "
             "--allow-unreviewed-metadata"
         )
+    return normalized
 
 
 # Max images per single upload session per platform (platform UI limits)
@@ -230,14 +228,14 @@ def run_upload(
                 continue
             try:
                 metadata = load_metadata(json_path)
-                _validate_metadata_binding(
+                normalized = _validate_metadata_binding(
                     img,
                     metadata,
                     allow_unbound_metadata,
                     allow_unreviewed_metadata,
                     allow_quality_warnings,
                 )
-                loaded.append((img, metadata))
+                loaded.append((img, normalized))
             except (OSError, ValueError, json.JSONDecodeError) as error:
                 print(f"  [review] {img.name}: {error}", flush=True)
                 preflight_results[img.name] = UploadStatus.NEEDS_REVIEW
@@ -383,7 +381,7 @@ def main() -> int:
     parser.add_argument(
         "--allow-quality-warnings",
         action="store_true",
-        help="Allow metadata with non-blocking discovery-quality warnings",
+        help="Deprecated compatibility flag; keyword-count advisories never block",
     )
     parser.add_argument(
         "--allow-repeated-metadata",

@@ -22,6 +22,7 @@ from playwright.sync_api import BrowserContext, Page, TimeoutError as PWTimeout
 
 from .browser import ensure_logged_in
 from .status import UploadStatus
+from metadata_core import commercial_submission_review_reason, platform_category
 
 LOGIN_URL  = "https://esp.gettyimages.com/"
 UPLOAD_URL = "https://esp.gettyimages.com/"
@@ -80,19 +81,23 @@ def _resolve_category(category1: str) -> Optional[str]:
     return None
 
 
+def _category_for_metadata(metadata: dict) -> Optional[str]:
+    explicit = platform_category(metadata, "istock")
+    if explicit:
+        return str(explicit)
+    return _resolve_category(str(metadata.get("category1", "")))
+
+
 def _auto_review_reason(metadata: dict) -> str:
     title = metadata.get("title_en") or metadata.get("description_en", "")
     if not str(title).strip():
         return "title is empty"
     if not metadata.get("keywords_en", [])[:50]:
         return "keywords are empty"
-    release_notes = str(metadata.get("release_notes", "")).strip()
-    release_status = str(metadata.get("release_status", "unknown")).strip().lower()
-    if release_status != "clear":
-        return f"release status is {release_status or 'unknown'}"
-    if release_notes:
-        return f"release review required — {release_notes}"
-    if _resolve_category(str(metadata.get("category1", ""))) is None:
+    commercial_reason = commercial_submission_review_reason(metadata)
+    if commercial_reason:
+        return commercial_reason
+    if _category_for_metadata(metadata) is None:
         return "category cannot be mapped to Getty/iStock"
     return ""
 
@@ -132,16 +137,12 @@ def _fill_metadata(page: Page, img: Path, metadata: dict) -> bool:
     """Fill required metadata, returning False if any required field fails."""
     title = (metadata.get("title_en") or metadata.get("description_en", ""))[:200]
     keywords = metadata.get("keywords_en", [])[:50]
-    release_notes = str(metadata.get("release_notes", "")).strip()
-    release_status = str(metadata.get("release_status", "unknown")).strip().lower()
     if not title or not keywords:
         print(f"  [review] {img.name}: title or keywords are empty", flush=True)
         return False
-    if release_status != "clear":
-        print(f"  [review] {img.name}: release status is {release_status or 'unknown'}", flush=True)
-        return False
-    if release_notes:
-        print(f"  [review] {img.name}: release review required — {release_notes}", flush=True)
+    commercial_reason = commercial_submission_review_reason(metadata)
+    if commercial_reason:
+        print(f"  [review] {img.name}: {commercial_reason}", flush=True)
         return False
 
     try:
@@ -187,7 +188,7 @@ def _fill_metadata(page: Page, img: Path, metadata: dict) -> bool:
         return False
 
     # Category — single select
-    category = _resolve_category(metadata.get("category1", ""))
+    category = _category_for_metadata(metadata)
     if category is None:
         print(f"  [review] category cannot be mapped for {img.name}", flush=True)
         return False

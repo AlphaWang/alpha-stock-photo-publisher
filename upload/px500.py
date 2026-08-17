@@ -169,7 +169,7 @@ def _resolve_path(location_zh: str) -> Optional[list[str]]:
 
 
 def _auto_review_reason(metadata: dict) -> str:
-    title = metadata.get("description_zh") or metadata.get("title_zh", "")
+    title = metadata.get("title_zh") or metadata.get("description_zh", "")
     if not str(title).strip():
         return "title is empty"
     keyword_count = len(metadata.get("keywords_zh", [])[:35])
@@ -177,7 +177,14 @@ def _auto_review_reason(metadata: dict) -> str:
         return f"only {keyword_count} keywords (min 5 required)"
     location = str(metadata.get("location_zh", "")).strip()
     if _resolve_path(location) is None:
-        return f"unknown shooting location: {location or '(empty)'}"
+        return (
+            "platform location requires manual selection; verified location is "
+            f"{location or '(unknown)'}"
+        )
+    if metadata.get("location_source", "unknown") == "unknown":
+        return "shooting location has no evidence source"
+    if metadata.get("location_confidence", "unknown") not in {"medium", "high"}:
+        return "shooting location confidence is too low for automatic selection"
     return ""
 
 
@@ -263,14 +270,23 @@ def _fill_metadata(page: Page, metadata: dict) -> bool:
     except PWTimeout:
         pass
 
-    title = (metadata.get("description_zh") or metadata.get("title_zh", ""))[:50]
+    title = (metadata.get("title_zh") or metadata.get("description_zh", ""))[:50]
     keywords = metadata.get("keywords_zh", [])[:35]
     location = metadata.get("location_zh", "")
     if not title or len(keywords) < 5:
         print("  [review] title or required keywords are missing", flush=True)
         return False
     if _resolve_path(location) is None:
-        print(f"  [review] unknown shooting location: {location or '(empty)'}", flush=True)
+        print(
+            "  [review] platform location requires manual selection; verified "
+            f"location is {location or '(unknown)'}",
+            flush=True,
+        )
+        return False
+    if metadata.get("location_source", "unknown") == "unknown" or metadata.get(
+        "location_confidence", "unknown"
+    ) not in {"medium", "high"}:
+        print("  [review] shooting location evidence is insufficient", flush=True)
         return False
 
     # Title

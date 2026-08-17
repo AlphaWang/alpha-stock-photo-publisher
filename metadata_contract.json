@@ -12,9 +12,18 @@
     "keywords_zh",
     "category1",
     "category2",
+    "platform_categories",
+    "location_en",
     "location_zh",
+    "location_source",
+    "location_confidence",
     "core_keywords_zh",
     "commercial_uses_en",
+    "model_release_status",
+    "property_release_status",
+    "logo_trademark_status",
+    "copyrighted_content_status",
+    "commercial_eligibility",
     "release_status",
     "release_notes"
   ],
@@ -25,7 +34,7 @@
     "description_zh": {"type": "string", "minLength": 1, "maxLength": 50},
     "keywords_en": {
       "type": "array",
-      "minItems": 5,
+      "minItems": 7,
       "maxItems": 50,
       "uniqueItems": true,
       "items": {"type": "string", "minLength": 1}
@@ -57,7 +66,62 @@
         "Sports/Recreation", "Technology", "Transportation", "Vintage"
       ]
     },
+    "platform_categories": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["shutterstock", "adobestock", "tuchong", "istock"],
+      "properties": {
+        "shutterstock": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "Abstract", "Animals/Wildlife", "Arts", "Backgrounds/Textures",
+              "Beauty/Fashion", "Buildings/Landmarks", "Business/Finance", "Celebrities",
+              "Education", "Food and drink", "Healthcare/Medical", "Holidays",
+              "Industrial", "Interiors", "Miscellaneous", "Nature", "Objects",
+              "Parks/Outdoor", "People", "Religion", "Science", "Signs/Symbols",
+              "Sports/Recreation", "Technology", "Transportation", "Vintage"
+            ]
+          }
+        },
+        "adobestock": {
+          "enum": [
+            "", "Animals", "Buildings and Architecture", "Business",
+            "Culture and Religion", "Food", "Graphic Resources",
+            "Hobbies and Leisure", "Industry", "Landscapes", "Lifestyle", "People",
+            "Plants and Flowers", "Science", "Social Issues", "Sports",
+            "States of Mind", "Technology", "The Environment", "Transport", "Travel"
+          ]
+        },
+        "tuchong": {
+          "type": "array",
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "自然风光", "城市风光", "野生动物", "静物美食", "生活方式",
+              "运动健康", "生物医疗", "节日假日", "商务肖像"
+            ]
+          }
+        },
+        "istock": {
+          "enum": [
+            "", "Nature", "Travel", "Buildings & Architecture", "Animals/Wildlife",
+            "Food and Drink", "People", "Sports", "Healthcare & Medical", "Holidays",
+            "Business", "Transport", "Technology"
+          ]
+        }
+      }
+    },
+    "location_en": {"type": "string", "maxLength": 80},
     "location_zh": {"type": "string", "maxLength": 80},
+    "location_source": {
+      "enum": ["unknown", "context", "exif", "manual", "visible_landmark"]
+    },
+    "location_confidence": {"enum": ["unknown", "low", "medium", "high"]},
     "core_keywords_zh": {
       "type": "array",
       "maxItems": 5,
@@ -70,6 +134,15 @@
       "uniqueItems": true,
       "items": {"type": "string", "minLength": 1}
     },
+    "model_release_status": {
+      "enum": ["not_required", "required", "provided", "unknown"]
+    },
+    "property_release_status": {
+      "enum": ["not_required", "required", "provided", "unknown"]
+    },
+    "logo_trademark_status": {"enum": ["none", "visible", "unknown"]},
+    "copyrighted_content_status": {"enum": ["none", "visible", "unknown"]},
+    "commercial_eligibility": {"enum": ["clear", "review", "editorial_only"]},
     "release_status": {"enum": ["clear", "required", "unknown"]},
     "release_notes": {"type": "string", "maxLength": 240}
   }

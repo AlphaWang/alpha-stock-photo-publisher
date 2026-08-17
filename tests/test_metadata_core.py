@@ -7,6 +7,8 @@ from pathlib import Path
 
 from metadata_core import (
     assess_metadata_quality,
+    commercial_submission_review_reason,
+    default_platform_categories,
     enforce_limits,
     find_batch_quality_issues,
     validate_metadata,
@@ -27,6 +29,8 @@ def sample_metadata():
             "road trip",
             "highway",
             "mountains",
+            "arid landscape",
+            "travel",
         ],
         "keywords_zh": ["沙漠公路", "日落", "自驾旅行", "高速公路", "远山"],
         "category1": "Transportation",
@@ -55,7 +59,10 @@ class MetadataCoreTests(unittest.TestCase):
 
         normalized = enforce_limits(metadata)
 
-        self.assertLessEqual(len(normalized["title_en"]), 70)
+        self.assertGreater(len(normalized["title_en"]), 70)
+        self.assertIn(
+            "title_en exceeds 70 characters", validate_metadata(normalized)
+        )
         self.assertEqual(normalized["keywords_en"][0], "sunset")
         self.assertEqual(normalized["keywords_en"].count("sunset"), 1)
         self.assertEqual(normalized["keywords_en"][1], "road trip")
@@ -65,7 +72,7 @@ class MetadataCoreTests(unittest.TestCase):
         errors = validate_metadata(enforce_limits({}))
 
         self.assertIn("title_en is required", errors)
-        self.assertIn("keywords_en must contain at least 5 unique keywords", errors)
+        self.assertIn("keywords_en must contain at least 7 unique keywords", errors)
 
     def test_invalid_categories_are_not_silently_replaced(self):
         metadata = sample_metadata()
@@ -117,6 +124,68 @@ class MetadataCoreTests(unittest.TestCase):
             "release_notes must explain required or unknown release status",
             validate_metadata_quality(metadata),
         )
+
+    def test_quality_validation_requires_primary_subject_in_first_keywords(self):
+        metadata = sample_metadata()
+        metadata["keywords_en"][:3] = ["wallpaper", "advertising", "background"]
+
+        errors = validate_metadata_quality(enforce_limits(metadata))
+
+        self.assertTrue(any("first three English keywords" in error for error in errors))
+
+    def test_quality_validation_rejects_repeated_keyword_stems(self):
+        metadata = sample_metadata()
+        metadata["keywords_en"] = [
+            "mountain", "mountain road", "mountain travel", "mountain scenery",
+            "mountain landscape", "sunset", "highway",
+        ]
+        metadata["title_en"] = "Mountain road at sunset"
+
+        errors = validate_metadata_quality(enforce_limits(metadata))
+
+        self.assertTrue(any("repeats word stems" in error for error in errors))
+
+    def test_chinese_fields_must_contain_chinese_text(self):
+        metadata = sample_metadata()
+        metadata["title_zh"] = "Desert road"
+
+        self.assertIn(
+            "title_zh must contain Chinese text",
+            validate_metadata_quality(enforce_limits(metadata)),
+        )
+
+    def test_location_requires_source_and_confidence(self):
+        metadata = sample_metadata()
+        metadata["location_en"] = "Grand Teton National Park"
+        metadata["location_zh"] = "大提顿国家公园"
+
+        errors = validate_metadata_quality(enforce_limits(metadata))
+
+        self.assertIn("a supplied location requires a known location_source", errors)
+        self.assertIn("a supplied location requires location_confidence", errors)
+
+    def test_platform_defaults_do_not_misclassify_transport_as_nature(self):
+        categories = default_platform_categories("Transportation", "")
+
+        self.assertEqual(categories["adobestock"], "Transport")
+        self.assertEqual(categories["tuchong"], [])
+
+    def test_structured_logo_risk_blocks_automatic_commercial_submission(self):
+        metadata = sample_metadata()
+        metadata.update(
+            {
+                "model_release_status": "not_required",
+                "property_release_status": "not_required",
+                "logo_trademark_status": "visible",
+                "copyrighted_content_status": "none",
+                "commercial_eligibility": "editorial_only",
+                "release_notes": "Visible trademark requires editorial review.",
+            }
+        )
+        normalized = enforce_limits(metadata)
+
+        self.assertEqual(normalized["release_status"], "required")
+        self.assertIn("logo/trademark", commercial_submission_review_reason(normalized))
 
     def test_batch_quality_detects_repeated_metadata(self):
         first = enforce_limits(sample_metadata())

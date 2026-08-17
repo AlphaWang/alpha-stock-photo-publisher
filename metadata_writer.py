@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from metadata_core import (
+    METADATA_FIELDS,
     SUPPORTED_EXTS,
     assess_metadata_quality,
     enforce_limits,
@@ -86,7 +87,7 @@ def main() -> int:
     parser.add_argument(
         "--strict-quality",
         action="store_true",
-        help="Treat discovery-quality warnings as errors",
+        help="Compatibility flag; critical quality checks are always enforced",
     )
     parser.add_argument(
         "--allow-repeated-metadata",
@@ -136,6 +137,13 @@ def main() -> int:
                 parser.error("audit receipt does not match the metadata manifest")
             if receipt.get("source_count") != len(items):
                 parser.error("audit receipt source count does not match the manifest")
+            if receipt.get("audit_schema_version") != 2:
+                parser.error("audit receipt does not cover the complete metadata schema")
+            audited_fields = receipt.get("audited_fields", [])
+            if not isinstance(audited_fields, list) or not set(
+                METADATA_FIELDS
+            ).issubset(set(audited_fields)):
+                parser.error("audit receipt is missing required audited fields")
             preview_manifest = Path(
                 str(receipt.get("preview_manifest", ""))
             ).expanduser().resolve()
@@ -180,11 +188,9 @@ def main() -> int:
             normalized = enforce_limits(metadata)
             errors = validate_metadata(normalized) + validate_metadata_quality(normalized)
             warnings = assess_metadata_quality(normalized)
-            if args.strict_quality:
-                errors.extend(warnings)
-            elif warnings:
+            if warnings:
                 print(
-                    f"[{index}/{len(items)}] quality warning: " + "; ".join(warnings),
+                    f"[{index}/{len(items)}] quality advisory: " + "; ".join(warnings),
                     file=sys.stderr,
                     flush=True,
                 )

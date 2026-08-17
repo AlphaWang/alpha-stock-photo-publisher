@@ -19,6 +19,7 @@ from playwright.sync_api import BrowserContext, Page, TimeoutError as PWTimeout
 from .browser import ensure_logged_in
 from .confirmation import wait_for_success_text
 from .status import UploadStatus
+from metadata_core import commercial_submission_review_reason, platform_category
 
 LOGIN_URL  = "https://contributor.tuchong.com/"
 UPLOAD_URL = "https://contributor.tuchong.com/contribute?category=0"
@@ -107,12 +108,28 @@ def _resolve_categories(category1: str) -> list[str]:
     return []
 
 
+def _categories_for_metadata(metadata: dict) -> list[str]:
+    explicit = platform_category(metadata, "tuchong")
+    if isinstance(explicit, list) and explicit:
+        return [str(value) for value in explicit[:2]]
+    categories = []
+    for field in ("category1", "category2"):
+        for value in _resolve_categories(str(metadata.get(field, ""))):
+            if value not in categories:
+                categories.append(value)
+    return categories[:2]
+
+
 def _fill_metadata(page: Page, metadata: dict) -> bool:
     """Fill required metadata and report whether every required field succeeded."""
     description = metadata.get("description_zh", "")[:50]
     keywords = metadata.get("keywords_zh", [])[:30]
     if not description or not keywords:
         print("  [review] description or keywords are missing")
+        return False
+    commercial_reason = commercial_submission_review_reason(metadata)
+    if commercial_reason:
+        print(f"  [review] {commercial_reason}")
         return False
 
     complete = True
@@ -133,7 +150,7 @@ def _fill_metadata(page: Page, metadata: dict) -> bool:
     # Image usage: defaults to commercial/advertising — no action needed
 
     # Image category — <input class="ant-input" placeholder="请选择"> opens a modal
-    cats = _resolve_categories(metadata.get("category1", ""))
+    cats = _categories_for_metadata(metadata)
     try:
         page.wait_for_function(
             "() => {"

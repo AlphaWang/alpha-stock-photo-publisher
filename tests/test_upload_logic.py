@@ -60,12 +60,21 @@ def complete_bound_metadata(image, *, include_hash=True, verified=True):
         "title_zh": "阳光下的山地景观",
         "description_en": "A sunlit mountain rises above a green summer meadow.",
         "description_zh": "阳光照亮山峰和绿色夏季草地。",
-        "keywords_en": [f"keyword-{index}" for index in range(20)],
-        "keywords_zh": [f"关键词{index}" for index in range(10)],
+        "keywords_en": [
+            "mountain", "green meadow", "sunlight", "summer landscape",
+            "blue sky", "outdoors", "nature", "scenic", "wilderness",
+            "alpine", "grassland", "daylight", "tranquil", "travel destination",
+            "natural beauty", "copy space", "horizontal", "environment",
+            "rural", "panoramic",
+        ],
+        "keywords_zh": [
+            "山峰", "绿色草地", "阳光", "夏季风景", "蓝天",
+            "户外", "自然", "高山", "宁静", "旅行",
+        ],
         "category1": "Nature",
         "category2": "Parks/Outdoor",
         "location_zh": "",
-        "core_keywords_zh": [f"关键词{index}" for index in range(5)],
+        "core_keywords_zh": ["山峰", "绿色草地", "阳光", "夏季风景", "蓝天"],
         "commercial_uses_en": ["travel marketing"],
         "release_status": "clear",
         "release_notes": "",
@@ -431,7 +440,7 @@ class UploadLogicTests(unittest.TestCase):
             "keywords_zh": ["山", "清晨", "自然", "风景", "旅行"],
             "location_zh": "",
         }
-        self.assertIn("unknown shooting location", px500_review_reason(metadata))
+        self.assertIn("manual selection", px500_review_reason(metadata))
 
     def test_upload_history_round_trip_uses_content_digest(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -484,7 +493,7 @@ class UploadLogicTests(unittest.TestCase):
                 _validate_metadata_binding(image, metadata, False)
             _validate_metadata_binding(image, metadata, False, True)
 
-    def test_thin_keywords_are_blocked_without_override(self):
+    def test_platform_minimum_keywords_are_blocked_even_with_legacy_override(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             image = Path(temp_dir) / "photo.jpg"
             image.write_bytes(bytes.fromhex(
@@ -494,9 +503,24 @@ class UploadLogicTests(unittest.TestCase):
             metadata["keywords_en"] = metadata["keywords_en"][:5]
             metadata["keywords_zh"] = metadata["keywords_zh"][:5]
 
-            with self.assertRaisesRegex(ValueError, "quality review required"):
+            with self.assertRaisesRegex(ValueError, "at least 7"):
                 _validate_metadata_binding(image, metadata, False)
-            _validate_metadata_binding(image, metadata, False, False, True)
+            with self.assertRaisesRegex(ValueError, "at least 7"):
+                _validate_metadata_binding(image, metadata, False, False, True)
+
+    def test_advisory_keyword_count_does_not_block_upload(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir) / "photo.jpg"
+            image.write_bytes(bytes.fromhex(
+                "47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b"
+            ))
+            metadata = complete_bound_metadata(image)
+            metadata["keywords_en"] = metadata["keywords_en"][:7]
+            metadata["keywords_zh"] = metadata["keywords_zh"][:5]
+            metadata["core_keywords_zh"] = metadata["keywords_zh"][:5]
+
+            normalized = _validate_metadata_binding(image, metadata, False)
+            self.assertEqual(len(normalized["keywords_en"]), 7)
 
     def test_find_pairs_keeps_same_stem_with_different_extensions(self):
         with tempfile.TemporaryDirectory() as temp_dir:

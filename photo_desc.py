@@ -29,7 +29,6 @@ from metadata_core import (
     SHUTTERSTOCK_KW_MAX,
     SUPPORTED_EXTS,
     SYSTEM_PROMPT,
-    assess_metadata_quality,
     enforce_limits,
     find_batch_quality_issues,
     validate_metadata,
@@ -97,6 +96,11 @@ def get_model() -> str:
     return os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 
+def get_verifier_model() -> str:
+    """Allow a separately configured verifier while retaining a safe fallback."""
+    return os.environ.get("ANTHROPIC_VERIFIER_MODEL", get_model())
+
+
 def load_image(
     path: Path, *, max_edge: int = 1024, quality: int = 70
 ) -> tuple[str, str]:
@@ -125,6 +129,46 @@ def load_image(
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=quality, optimize=True)
     return base64.standard_b64encode(buf.getvalue()).decode(), "image/jpeg"
+
+
+def load_image_crops(
+    path: Path, *, max_edge: int = 1024, quality: int = 80
+) -> list[tuple[str, str]]:
+    """Encode four overlapping quadrants for small text/logo/release review."""
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:
+        sys.exit(
+            "Anthropic fallback image support is missing. Install it with: "
+            "pip install pillow"
+        )
+
+    encoded = []
+    with Image.open(path) as opened:
+        opened.seek(0)
+        image = ImageOps.exif_transpose(opened).convert("RGB")
+        width, height = image.size
+        if max(width, height) <= max_edge:
+            return []
+        overlap_x = max(1, width // 12)
+        overlap_y = max(1, height // 12)
+        mid_x, mid_y = width // 2, height // 2
+        boxes = (
+            (0, 0, min(width, mid_x + overlap_x), min(height, mid_y + overlap_y)),
+            (max(0, mid_x - overlap_x), 0, width, min(height, mid_y + overlap_y)),
+            (0, max(0, mid_y - overlap_y), min(width, mid_x + overlap_x), height),
+            (max(0, mid_x - overlap_x), max(0, mid_y - overlap_y), width, height),
+        )
+        resampling = getattr(Image, "Resampling", Image).LANCZOS
+        for box in boxes:
+            crop = image.crop(box)
+            crop.thumbnail((max_edge, max_edge), resampling)
+            buffer = io.BytesIO()
+            crop.save(buffer, format="JPEG", quality=quality, optimize=True)
+            encoded.append(
+                (base64.standard_b64encode(buffer.getvalue()).decode(), "image/jpeg")
+            )
+    return encoded
 
 
 def _json_from_response(response) -> dict:
@@ -205,46 +249,59 @@ def analyze_image(
 def verify_metadata(
     image_path: Path, metadata: dict, client, context: str = ""
 ) -> tuple[bool, list[str]]:
-    """Run an independent visual-grounding pass at a higher preview resolution."""
+    """Run a context-isolated visual-grounding pass with detailed crops."""
     data, media_type = load_image(image_path, max_edge=1536, quality=78)
-    context_note = (
-        "\nShooting context may establish location only: " + context if context else ""
-    )
+    image_blocks = [
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": data,
+            },
+        }
+    ]
+    for crop_data, crop_media_type in load_image_crops(image_path):
+        image_blocks.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": crop_media_type,
+                    "data": crop_data,
+                },
+            }
+        )
     last_error = None
     for attempt in range(3):
         try:
             response = client.messages.create(
-                model=get_model(),
+                model=get_verifier_model(),
                 max_tokens=1024,
                 system=(
-                    "You are an independent stock-photo metadata verifier. Compare the "
-                    "proposed metadata against this image only. Check every concrete "
+                    "You are a stock-photo metadata verifier. The first image is a full "
+                    "preview and any following images are overlapping crops of the same "
+                    "source. Compare the proposed bilingual metadata against these images "
+                    "only. Check every concrete "
                     "subject, action, water body, landform, structure, person, text/logo, "
-                    "landmark, weather claim, keyword, and release risk. A path or "
-                    "shooting context can support location but cannot prove that a subject "
-                    "is visible. Fail material omissions of the primary commercial subject "
-                    "or any invented visual claim. Return strict JSON only as "
+                    "landmark, weather claim, English and Chinese keyword, platform category, "
+                    "and release/IP risk. Location fields whose location_source is context, "
+                    "EXIF, or manual need not be visually provable, but they must not make a "
+                    "nonvisible subject appear visible in a title or description. Fail "
+                    "material omissions of the primary commercial subject, bilingual "
+                    "contradictions, or any invented visual claim. Return strict JSON only as "
                     "{\"verdict\":\"pass\",\"issues\":[]} or "
                     "{\"verdict\":\"fail\",\"issues\":[\"specific correction\"]}."
                 ),
                 messages=[
                     {
                         "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": media_type,
-                                    "data": data,
-                                },
-                            },
+                        "content": image_blocks + [
                             {
                                 "type": "text",
                                 "text": (
                                     "Verify this proposed metadata:\n"
                                     + json.dumps(metadata, ensure_ascii=False)
-                                    + context_note
                                 ),
                             },
                         ],
@@ -282,7 +339,6 @@ def generate_one(
             static_issues = (
                 validate_metadata(result)
                 + validate_metadata_quality(result)
-                + assess_metadata_quality(result)
             )
             if static_issues:
                 passed, issues = False, static_issues

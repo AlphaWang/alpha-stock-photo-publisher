@@ -24,6 +24,7 @@ from playwright.sync_api import BrowserContext, TimeoutError as PWTimeout
 from .browser import ensure_logged_in
 from .confirmation import wait_for_success_text
 from .status import UploadStatus
+from metadata_core import commercial_submission_review_reason, platform_category
 
 PORTFOLIO_URL = "https://submit.shutterstock.com/portfolio/not_submitted/photo"
 LOGIN_URL = "https://submit.shutterstock.com/"
@@ -201,6 +202,10 @@ def _set_categories(page, category1: str, category2: str) -> bool:
 
 def _fill_metadata(page, img: Path, meta: dict) -> bool:
     """Fill description, keywords, and categories for the currently open edit panel."""
+    commercial_reason = commercial_submission_review_reason(meta)
+    if commercial_reason:
+        print(f"  [review] {img.name}: {commercial_reason}")
+        return False
     # Wait for the panel to show THIS image's title before filling anything.
     # Without this, a React re-render caused by the card transition can clear
     # a description we already filled.
@@ -235,7 +240,12 @@ def _fill_metadata(page, img: Path, meta: dict) -> bool:
     kw_input.fill(", ".join(meta.get("keywords_en", [])))
     kw_input.press("Enter")
 
-    cat1, cat2 = meta.get("category1", ""), meta.get("category2", "")
+    platform_categories = platform_category(meta, "shutterstock")
+    if isinstance(platform_categories, list) and platform_categories:
+        cat1 = platform_categories[0]
+        cat2 = platform_categories[1] if len(platform_categories) > 1 else ""
+    else:
+        cat1, cat2 = meta.get("category1", ""), meta.get("category2", "")
     if not _set_categories(page, cat1, cat2):
         return False
 

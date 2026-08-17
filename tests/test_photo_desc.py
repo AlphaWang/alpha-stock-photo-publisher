@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from photo_desc import main, process_one
+from photo_desc import main, process_one, verify_metadata
 
 
 def complete_metadata():
@@ -14,12 +14,21 @@ def complete_metadata():
         "title_zh": "绿色草地上方的阳光山峰",
         "description_en": "A sunlit mountain rises above a green summer meadow.",
         "description_zh": "阳光照亮山峰和绿色夏季草地。",
-        "keywords_en": [f"keyword-{index}" for index in range(20)],
-        "keywords_zh": [f"关键词{index}" for index in range(10)],
+        "keywords_en": [
+            "mountain", "green meadow", "sunlight", "summer landscape",
+            "blue sky", "outdoors", "nature", "scenic", "wilderness",
+            "alpine", "grassland", "daylight", "tranquil", "travel destination",
+            "natural beauty", "copy space", "horizontal", "environment",
+            "rural", "panoramic",
+        ],
+        "keywords_zh": [
+            "山峰", "绿色草地", "阳光", "夏季风景", "蓝天",
+            "户外", "自然", "高山", "宁静", "旅行",
+        ],
         "category1": "Nature",
         "category2": "Parks/Outdoor",
         "location_zh": "",
-        "core_keywords_zh": [f"关键词{index}" for index in range(5)],
+        "core_keywords_zh": ["山峰", "绿色草地", "阳光", "夏季风景", "蓝天"],
         "commercial_uses_en": ["travel marketing"],
         "release_status": "clear",
         "release_notes": "",
@@ -27,6 +36,45 @@ def complete_metadata():
 
 
 class PhotoDescriptionTests(unittest.TestCase):
+    def test_visual_verifier_uses_crops_without_shooting_context(self):
+        captured = {}
+
+        class Messages:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return type(
+                    "Response",
+                    (),
+                    {
+                        "content": [
+                            type(
+                                "Block",
+                                (),
+                                {"type": "text", "text": '{"verdict":"pass","issues":[]}'},
+                            )()
+                        ]
+                    },
+                )()
+
+        client = type("Client", (), {"messages": Messages()})()
+        with patch("photo_desc.load_image", return_value=("full", "image/jpeg")):
+            with patch(
+                "photo_desc.load_image_crops",
+                return_value=[("crop-1", "image/jpeg"), ("crop-2", "image/jpeg")],
+            ):
+                passed, issues = verify_metadata(
+                    Path("photo.jpg"),
+                    complete_metadata(),
+                    client,
+                    context="SECRET SHOOTING CONTEXT",
+                )
+
+        self.assertTrue(passed)
+        self.assertEqual(issues, [])
+        content = captured["messages"][0]["content"]
+        self.assertEqual(sum(item["type"] == "image" for item in content), 3)
+        self.assertNotIn("SECRET SHOOTING CONTEXT", str(content))
+
     def test_process_one_writes_only_after_visual_verification(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             directory = Path(temp_dir)

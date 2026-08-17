@@ -89,11 +89,14 @@ The copies under `.agents/skills/` and `.claude/skills/` are intentionally ident
 Use this when the current agent cannot inspect local images, or when running outside an agent host:
 
 ```bash
-python3 photo_desc.py /path/to/dir
-python3 photo_desc.py /path/to/dir --context "SLC road trip"
+python3 photo_desc.py /path/to/dir --allow-anthropic-api
+python3 photo_desc.py /path/to/dir --allow-anthropic-api --context "SLC road trip"
 ```
 
 This path requires the optional Anthropic dependencies and credentials above. It
+also requires the explicit `--allow-anthropic-api` acknowledgement; configured
+credentials or a Claude gateway do not authorize an agent-native workflow to use
+this path. Batch size, speed, or convenience are not provider-routing signals. It
 uses a 1024px generation preview followed by a context-isolated 1536px visual
 verification pass with overlapping crops for small text, logos, and people. Set
 `ANTHROPIC_VERIFIER_MODEL` to use a separately configured verifier model. A rejected draft is regenerated once, and the completed batch

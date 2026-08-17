@@ -7,6 +7,13 @@ description: Generate buyer-focused bilingual stock photo metadata from local im
 
 Generate accurate, commercially useful metadata with the host agent's native image understanding, then upload only when the user explicitly requests it.
 
+## Keep AI inference on the active host
+
+- Use the active host's native model for every image-understanding, metadata-generation, and visual-verification step. Codex must use Codex-native image inspection; Claude Code must use Claude-native image inspection.
+- Never invoke an external or cross-provider AI SDK, gateway, CLI, or model from the agent-native workflow. Batch size, speed, convenience, available credentials, installed dependencies, or configured environment variables never justify switching providers.
+- Treat `ANTHROPIC_API_KEY`, `CLAUDE_GATEWAY_URL`, and similar settings only as evidence that an optional standalone path is available, never as user consent or a routing signal.
+- In the agent-native workflow, run only deterministic local preparation, review-pack, validation, and writing scripts. Do not run `photo_desc.py`; it is an explicitly authorized standalone Anthropic path, not a batch accelerator for the native workflow.
+
 ## Interpret the request
 
 - Treat description, keyword, metadata, or preparation requests as metadata-only.
@@ -149,15 +156,17 @@ python3 prepare_images.py --cleanup <preview-manifest>
 
 Never delete or modify the source photos.
 
-## API fallback
+## Explicit Anthropic fallback
 
-If the host cannot inspect local images, use the optional standalone Anthropic fallback:
+Do not enter this path automatically. Use the standalone Anthropic API only when the user explicitly requests it, or when the host cannot inspect local images and the user explicitly authorizes it after being told that it changes the inference provider and may incur separate API usage. Never infer authorization from credentials, gateway configuration, dependencies, batch size, or time pressure.
+
+When explicitly authorized, require the command-level acknowledgement flag:
 
 ```bash
-python3 photo_desc.py <path> [--context "<shooting context>"]
+python3 photo_desc.py <path> --allow-anthropic-api [--context "<shooting context>"]
 ```
 
-This fallback alone requires the packages in `requirements-anthropic.txt` and Anthropic credentials. It performs a context-isolated higher-resolution visual verification pass with overlapping crops, produces and validates the same visual-facts contract, retries one rejected draft, and checks batch curation and repetition before writing. Set `ANTHROPIC_VERIFIER_MODEL` to use a separately configured verifier model. If neither native image inspection nor the fallback is available, explain what is missing and stop; never fabricate metadata.
+This path alone requires the packages in `requirements-anthropic.txt` and Anthropic credentials. It performs a context-isolated higher-resolution visual verification pass with overlapping crops, produces and validates the same visual-facts contract, retries one rejected draft, and checks batch curation and repetition before writing. Set `ANTHROPIC_VERIFIER_MODEL` to use a separately configured verifier model. If native image inspection is unavailable and the user does not authorize Anthropic, explain what is missing and stop; never fabricate metadata.
 
 ## Upload when requested
 

@@ -46,6 +46,18 @@ def mountain_visual_facts():
 
 
 class PhotoDescriptionTests(unittest.TestCase):
+    def test_main_requires_explicit_anthropic_authorization(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir) / "mountain.jpg"
+            image.touch()
+
+            with patch("photo_desc.make_client") as make_client:
+                with patch.object(sys, "argv", ["photo_desc.py", str(image)]):
+                    result = main()
+
+            self.assertEqual(result, 2)
+            make_client.assert_not_called()
+
     def test_visual_verifier_uses_crops_without_shooting_context(self):
         captured = {}
 
@@ -148,7 +160,15 @@ class PhotoDescriptionTests(unittest.TestCase):
 
             with patch("photo_desc.make_client", return_value=object()):
                 with patch("photo_desc.generate_one", side_effect=generated):
-                    with patch.object(sys, "argv", ["photo_desc.py", str(directory)]):
+                    with patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "photo_desc.py",
+                            str(directory),
+                            "--allow-anthropic-api",
+                        ],
+                    ):
                         result = main()
 
             self.assertEqual(result, 1)

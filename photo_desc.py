@@ -6,8 +6,8 @@ Shutterstock, 500px, and similar platforms. Agent-native workflows use
 metadata_writer.py instead and do not require an AI API key.
 
 Usage:
-  Single image: python3 photo_desc.py <image> [--output <dir>]
-  Batch:        python3 photo_desc.py <directory> [--output <dir>]
+  Single image: python3 photo_desc.py <image> --allow-anthropic-api [--output <dir>]
+  Batch:        python3 photo_desc.py <directory> --allow-anthropic-api [--output <dir>]
 """
 
 import argparse
@@ -443,7 +443,23 @@ def main() -> int:
     parser.add_argument("--output", "-o", default=None, help="Output directory (default: same directory as the image)")
     parser.add_argument("--workers", "-w", type=int, default=3, help="Parallel workers for batch mode (default: 3)")
     parser.add_argument("--context", "-c", default="", help="Additional context about the photos (e.g. location, scene, shooting conditions)")
+    parser.add_argument(
+        "--allow-anthropic-api",
+        action="store_true",
+        help=(
+            "Explicitly acknowledge that this standalone path sends images to "
+            "the Anthropic API or a configured Claude gateway"
+        ),
+    )
     args = parser.parse_args()
+
+    if not args.allow_anthropic_api:
+        print(
+            "Refusing to invoke Anthropic without explicit authorization. "
+            "Use --allow-anthropic-api only when Anthropic API usage is intended.",
+            file=sys.stderr,
+        )
+        return 2
 
     target = Path(args.target).expanduser().resolve()
     fixed_output = Path(args.output).expanduser().resolve() if args.output else None

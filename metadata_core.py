@@ -1,5 +1,7 @@
 """Shared stock metadata contract, normalization, and persistence helpers."""
 
+from __future__ import annotations
+
 import json
 import hashlib
 import re

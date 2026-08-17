@@ -10,6 +10,8 @@ Usage:
   Batch:        python3 photo_desc.py <directory> --allow-anthropic-api [--output <dir>]
 """
 
+from __future__ import annotations
+
 import argparse
 import base64
 import io

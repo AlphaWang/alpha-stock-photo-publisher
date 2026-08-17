@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Validate agent-generated stock metadata and write timestamped JSON files."""
 
+from __future__ import annotations
+
 import argparse
 import json
 import sys

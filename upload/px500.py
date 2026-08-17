@@ -206,6 +206,31 @@ def _image_review_reason(image: Path) -> str:
         return f"could not inspect image dimensions: {error}"
 
 
+def _draft_save_is_confirmed(
+    acknowledgement_seen: bool,
+    error_count: int,
+    actual_title: str,
+    expected_title: str,
+) -> bool:
+    """Require an explicit save acknowledgement plus intact form state."""
+    return (
+        acknowledgement_seen
+        and error_count == 0
+        and actual_title == expected_title
+    )
+
+
+def _save_response_is_successful(response) -> bool:
+    """Accept only the successful draft-save API response."""
+    if response is None or not response.ok:
+        return False
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and payload.get("status") == 200
+
+
 def _navigate_cascader(page: Page, path: list[str]) -> bool:
     """Click through the 3-level location cascader. Returns True on success."""
     # Open the cascader
@@ -344,16 +369,36 @@ def _fill_metadata(page: Page, metadata: dict) -> bool:
         pass
 
     # Save as draft
-    page.locator("button:has-text('保存草稿')").first.click()
-    if wait_for_success_text(
-        page,
-        ["保存成功", "草稿已保存", "操作成功"],
-        timeout=5_000,
-    ):
-        return True
-    page.wait_for_timeout(1_000)
+    save_response = None
+    try:
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "POST"
+                and "/api/draftBox/" in response.url
+                and response.url.endswith("/save")
+            ),
+            timeout=90_000,
+        ) as response_info:
+            page.locator("button:has-text('保存草稿')").first.click()
+        save_response = response_info.value
+    except PWTimeout:
+        # Older UI revisions acknowledged saves only through a transient toast.
+        pass
+
+    acknowledgement_seen = _save_response_is_successful(save_response)
+    if not acknowledgement_seen:
+        acknowledgement_seen = wait_for_success_text(
+            page,
+            ["保存成功", "草稿已保存", "操作成功"],
+            timeout=3_000,
+        )
     errors = page.locator(".ant-message-error, .ant-form-item-has-error")
-    return errors.count() == 0 and page.locator(title_sel).first.input_value() == title
+    return _draft_save_is_confirmed(
+        acknowledgement_seen,
+        errors.count(),
+        page.locator(title_sel).first.input_value(),
+        title,
+    )
 
 
 def _select_upload_files(page: Page, images: list[Path]) -> None:

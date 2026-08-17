@@ -4,7 +4,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 # Pure upload rules should remain testable without launching or installing a browser.
 if "playwright.sync_api" not in sys.modules:
@@ -26,6 +26,10 @@ from upload.adobestock import _resolve_category as resolve_adobe_category
 from upload.adobestock import upload_batch as upload_adobe_batch
 from upload.istock import _auto_review_reason as istock_review_reason
 from upload.px500 import _auto_review_reason as px500_review_reason
+from upload.px500 import (
+    _draft_save_is_confirmed as px500_save_confirmed,
+    _save_response_is_successful as px500_response_successful,
+)
 from upload.px500 import _resolve_path
 from upload.px500 import _resolution_review_reason as px500_resolution_review_reason
 import upload.px500 as px500_module
@@ -123,6 +127,25 @@ class UploadLogicTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "water_visible=no"):
                 _validate_metadata_binding(image, metadata, False)
+
+    def test_500px_requires_explicit_save_confirmation(self):
+        self.assertTrue(px500_save_confirmed(True, 0, "标题", "标题"))
+        self.assertFalse(px500_save_confirmed(False, 0, "标题", "标题"))
+        self.assertFalse(px500_save_confirmed(True, 1, "标题", "标题"))
+        self.assertFalse(px500_save_confirmed(True, 0, "", "标题"))
+
+    def test_500px_accepts_only_successful_save_response(self):
+        successful = Mock(ok=True)
+        successful.json.return_value = {"status": 200, "data": {}}
+        failed = Mock(ok=True)
+        failed.json.return_value = {"status": 500, "message": "failed"}
+        invalid = Mock(ok=True)
+        invalid.json.side_effect = ValueError("not json")
+
+        self.assertTrue(px500_response_successful(successful))
+        self.assertFalse(px500_response_successful(failed))
+        self.assertFalse(px500_response_successful(invalid))
+        self.assertFalse(px500_response_successful(None))
 
     def test_shutterstock_category_labels_are_canonicalized(self):
         self.assertEqual(_canonical_category("Nature"), "Nature")

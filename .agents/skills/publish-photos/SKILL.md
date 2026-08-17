@@ -22,12 +22,16 @@ Generate accurate, commercially useful metadata with the host agent's native ima
 3. Before native inspection, create local privacy-reduced previews:
 
 ```bash
-python3 prepare_images.py <path>
+python3 prepare_images.py <path> --max-edge 1536 --detail-crops
 ```
 
-Read the reported `preview_manifest.json` and inspect the preview paths, not the source paths. Previews are EXIF-corrected, metadata-free JPEGs with a default maximum edge of 1024 pixels. If preparation fails because Pillow is missing, report the dependency instead of silently sending originals.
+Read the reported `preview_manifest.json` and inspect the overview plus all four overlapping `detail_previews`, not the source paths. Previews are EXIF-corrected, metadata-free JPEGs. Detail crops are mandatory for detecting small aircraft, wildlife tags/collars, distant people, text, and logos. If preparation fails because Pillow is missing, report the dependency instead of silently sending originals.
 
-4. Use the host's available native image-inspection capability to examine previews whose source images are missing metadata. For a large set, work in manageable batches, but ground every metadata object in its own preview. Never assign a scene template from neighboring filenames or assume that consecutive frames contain the same subjects. Before writing metadata, make a short visual-facts note for each image covering the visible primary subject, foreground, background, water/landform, people, structures, text/logos, and composition. Reinspect an original or a focused high-resolution crop when small text, a logo, a recognizable person/property, or another release risk cannot be judged from the preview.
+4. Use the host's available native image-inspection capability to examine previews whose source images are missing metadata. First inspect each image without using its folder name, neighboring frames, or shooting context and complete every field in `visual_facts_contract.json`. Use `yes`, `no`, or `unknown`; never turn uncertainty into `no`. Then apply supplied context only to location fields. For a large set, work in manageable batches, but ground every facts object and metadata object in that image's own overview and detail crops. Never assign a scene template from neighboring filenames or assume that consecutive frames contain the same subjects.
+   - Put every primary commercial subject in `primary_subjects_en/zh`; use `required_terms_en/zh` for small but material details such as an aircraft or tracking collar, and `forbidden_claims_en/zh` for plausible misidentifications such as cabin versus barn.
+   - When `text_visible` is yes, inspect detail crops and use native OCR if available. Record commercially material visible wording in required terms or put unreadable text in `uncertain_details`; never guess. Distinguish ordinary text from an actual logo/trademark.
+   - Give each distinct scene a concise `scene_signature`. Assign near-identical frames a shared `burst_group_id`, rank selected frames from strongest to weakest with `burst_rank`, and keep at most three. Leave `burst_group_id` empty and use rank 0 outside a burst.
+   - Persist only frames with `technical_quality: pass` and `selection_status: selected`. Assess `commercial_potential` and list concrete `commercial_strengths_en`; do not select a weak frame merely to preserve a sequence.
 5. Do not invent a location, landmark, species, identity, brand, season, or event. Use supplied path/context as supporting evidence, but distinguish context from visible evidence: for example, a Jenny Lake folder can establish shooting location but does not justify saying that the lake is visible. Leave `location_en` and `location_zh` empty, with unknown source/confidence, when location is not reliable.
 6. Create a separate temporary metadata manifest containing an array of objects in this form, using each original `source` path from the preview manifest as `image`:
 
@@ -35,6 +39,36 @@ Read the reported `preview_manifest.json` and inspect the preview paths, not the
 [
   {
     "image": "/absolute/path/photo.jpg",
+    "visual_facts": {
+      "schema_version": 1,
+      "primary_subjects_en": ["mountain cabin"],
+      "primary_subjects_zh": ["山间木屋"],
+      "required_terms_en": [],
+      "required_terms_zh": [],
+      "forbidden_claims_en": ["barn", "lake", "trail"],
+      "forbidden_claims_zh": ["谷仓", "湖泊", "步道"],
+      "water_visible": "no",
+      "trail_visible": "no",
+      "people_visible": "no",
+      "recognizable_people_visible": "no",
+      "structures_visible": "yes",
+      "vehicles_visible": "no",
+      "animals_visible": "no",
+      "reflection_visible": "no",
+      "text_visible": "no",
+      "logo_or_trademark_visible": "no",
+      "copyrighted_content_visible": "no",
+      "private_property_visible": "unknown",
+      "copy_space_visible": "yes",
+      "scene_signature": "single-cabin-meadow-mountain-background",
+      "burst_group_id": "",
+      "burst_rank": 0,
+      "technical_quality": "pass",
+      "commercial_potential": "medium",
+      "commercial_strengths_en": ["clear rustic travel concept", "usable sky copy space"],
+      "selection_status": "selected",
+      "uncertain_details": ["property ownership cannot be determined visually"]
+    },
     "metadata": {
       "title_en": "...",
       "title_zh": "...",
@@ -57,18 +91,18 @@ Read the reported `preview_manifest.json` and inspect the preview paths, not the
       "core_keywords_zh": ["..."],
       "commercial_uses_en": ["..."],
       "model_release_status": "not_required",
-      "property_release_status": "not_required",
+      "property_release_status": "unknown",
       "logo_trademark_status": "none",
       "copyrighted_content_status": "none",
-      "commercial_eligibility": "clear",
-      "release_status": "clear",
-      "release_notes": ""
+      "commercial_eligibility": "review",
+      "release_status": "unknown",
+      "release_notes": "Property release status requires manual review."
     }
   }
 ]
 ```
 
-7. Build and audit the complete batch before persistence:
+7. Build the immutable review pack before persistence:
 
 ```bash
 python3 metadata_contact_sheet.py \
@@ -76,14 +110,23 @@ python3 metadata_contact_sheet.py \
   --metadata-manifest <temporary-manifest>
 ```
 
-   - Inspect every generated sheet reported by the command. Reinspect scene boundaries, isolated subjects, unusual aspect ratios, and every frame containing people, buildings, signs, text, or logos.
-   - Each sheet contains one image and every English/Chinese title, description, keyword, category, location-evidence, commercial-use, and release/IP field. Compare every concrete noun and action against that image. Water bodies, structures, wildlife, people, vehicles, and landmarks must be visibly present unless phrased only as reliable shooting-location context.
+   This command creates `metadata_review_pack.json` and a non-passing `metadata_review_decisions.json` template; it does not create an audit receipt.
+   - Start a fresh, context-isolated verification pass and inspect every generated sheet, including overview and detail crops. Reinspect scene boundaries, isolated subjects, unusual aspect ratios, and every frame containing people, buildings, signs, text, or logos.
+   - Each sheet contains one image, its structured visual facts, and every English/Chinese title, description, keyword, category, location-evidence, commercial-use, and release/IP field. Compare every concrete noun and action against that image. Water bodies, structures, wildlife, people, vehicles, and landmarks must be visibly present unless phrased only as reliable shooting-location context.
    - Treat repeated factual lead sentences across more than five images as an audit trigger. Similar burst frames may share facts, but rotating adjectives or adding generic composition prose is not a substitute for per-image inspection.
    - When near-identical burst frames need the same factual metadata, curate the weaker frames out of the upload set instead of inventing wording differences.
    - Remove generic filler such as `Presented as ...`; descriptions should say what buyers can actually see.
    - Set `release_notes` to an empty string when `release_status` is `clear`; do not add boilerplate claiming that no risks are visible.
 
-8. Only after every contact sheet passes review, validate, normalize, and persist the results with the generated audit receipt:
+8. For each image, edit the decision template only after review: set all four verdicts to `pass`, keep `issues` empty, list `overview`, `visual_facts`, `metadata`, and `detail_crops` under `reviewed_evidence`, set reviewer provenance, and set `independent_review` to true. A failed image must be corrected and the review pack regenerated; never mark a known issue as pass. Then issue the receipt:
+
+```bash
+python3 metadata_review_finalize.py \
+  --review-pack <metadata-review-pack> \
+  --decisions <metadata-review-decisions>
+```
+
+Only after the v3 receipt is issued, validate, normalize, and persist the results:
 
 ```bash
 python3 metadata_writer.py \
@@ -94,7 +137,7 @@ python3 metadata_writer.py \
   --audit-receipt <metadata-audit-receipt>
 ```
 
-The writer preflights the whole manifest before writing anything. It blocks critical factual defects, keyword spam, weak first-keyword ordering, repeated titles/descriptions, unsupported locations, release contradictions, invalid platform categories, and audit receipts that do not cover the complete schema. Counts below the recommended 15 English or 8 Chinese keywords are advisory only; never pad to silence them. Report failures by image and correct them before continuing; do not use repetition overrides in the normal skill workflow.
+The writer preflights the whole manifest before writing anything. It blocks incomplete visual facts, facts/metadata contradictions, rejected or weak technical selections, more than three selected burst frames, critical factual defects, keyword spam, weak first-keyword ordering, unsupported locations, release contradictions, invalid platform categories, and incomplete or changed review artifacts. Exact metadata reuse is allowed only for at most three explicitly ranked frames in the same burst with the same scene signature; do not rotate adjectives to evade duplicate detection. Counts below the recommended 15 English or 8 Chinese keywords are advisory only; never pad to silence them.
 Writing beside images on an external volume may require user approval.
 The writer binds each JSON to the source image with SHA-256. Legacy unbound JSON requires explicit `--allow-unbound-metadata` during upload and should normally be regenerated.
 
@@ -114,7 +157,7 @@ If the host cannot inspect local images, use the optional standalone Anthropic f
 python3 photo_desc.py <path> [--context "<shooting context>"]
 ```
 
-This fallback alone requires the packages in `requirements-anthropic.txt` and Anthropic credentials. It performs a context-isolated higher-resolution visual verification pass with overlapping crops, retries one rejected draft, and checks the completed batch for repeated titles and descriptions before writing. Set `ANTHROPIC_VERIFIER_MODEL` to use a separately configured verifier model. If neither native image inspection nor the fallback is available, explain what is missing and stop; never fabricate metadata.
+This fallback alone requires the packages in `requirements-anthropic.txt` and Anthropic credentials. It performs a context-isolated higher-resolution visual verification pass with overlapping crops, produces and validates the same visual-facts contract, retries one rejected draft, and checks batch curation and repetition before writing. Set `ANTHROPIC_VERIFIER_MODEL` to use a separately configured verifier model. If neither native image inspection nor the fallback is available, explain what is missing and stop; never fabricate metadata.
 
 ## Upload when requested
 

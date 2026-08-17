@@ -51,6 +51,8 @@ from upload_photos import (
 )
 from upload_photos import _result_counts
 from cleanup_tuchong_drafts import DraftCard, _delete_card
+from test_visual_facts import complete_visual_facts
+from visual_facts import visual_facts_sha256
 
 
 def complete_bound_metadata(image, *, include_hash=True, verified=True):
@@ -86,6 +88,42 @@ def complete_bound_metadata(image, *, include_hash=True, verified=True):
 
 
 class UploadLogicTests(unittest.TestCase):
+    def test_agent_native_upload_requires_bound_visual_facts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir) / "photo.jpg"
+            image.write_bytes(bytes.fromhex(
+                "47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b"
+            ))
+            metadata = complete_bound_metadata(image)
+            metadata["visual_review_method"] = "agent-native"
+
+            with self.assertRaisesRegex(ValueError, "missing machine-readable"):
+                _validate_metadata_binding(image, metadata, False)
+
+    def test_upload_rechecks_metadata_against_visual_facts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir) / "photo.jpg"
+            image.write_bytes(bytes.fromhex(
+                "47494638396101000100800000000000ffffff21f90401000000002c00000000010001000002024401003b"
+            ))
+            metadata = complete_bound_metadata(image)
+            metadata["visual_review_method"] = "agent-native"
+            metadata["description_en"] = (
+                "A sunlit mountain rises above a lake and green meadow."
+            )
+            facts = {
+                **complete_visual_facts(),
+                "primary_subjects_en": ["mountain"],
+                "primary_subjects_zh": ["山峰"],
+                "water_visible": "no",
+                "scene_signature": "mountain-meadow",
+            }
+            metadata["visual_facts"] = facts
+            metadata["visual_facts_sha256"] = visual_facts_sha256(facts)
+
+            with self.assertRaisesRegex(ValueError, "water_visible=no"):
+                _validate_metadata_binding(image, metadata, False)
+
     def test_shutterstock_category_labels_are_canonicalized(self):
         self.assertEqual(_canonical_category("Nature"), "Nature")
         self.assertEqual(_canonical_category("自然"), "Nature")

@@ -643,7 +643,10 @@ def assess_metadata_quality(result: dict) -> list[str]:
 
 
 def find_batch_quality_issues(
-    records: list[tuple[str, dict]], *, lead_repeat_limit: int = 5
+    records: list[tuple[str, dict]],
+    *,
+    lead_repeat_limit: int = 5,
+    visual_facts_by_source: dict[str, dict] | None = None,
 ) -> dict[str, list[str]]:
     """Find repeated metadata that can hide scene-boundary classification errors."""
     issues: dict[str, list[str]] = defaultdict(list)
@@ -667,6 +670,15 @@ def find_batch_quality_issues(
         for sources in groups.values():
             if len(sources) < 2:
                 continue
+            if visual_facts_by_source:
+                # Local import avoids making the base metadata contract depend on
+                # visual-review tooling for legacy/manual workflows.
+                from visual_facts import repetition_allowed_for_curated_burst
+
+                if repetition_allowed_for_curated_burst(
+                    sources, visual_facts_by_source
+                ):
+                    continue
             message = f"duplicate {field} shared by {len(sources)} images"
             for source in sources:
                 issues[source].append(message)
@@ -698,10 +710,21 @@ def write_metadata(
     *,
     visual_review_status: str = "unreviewed",
     visual_review_method: str = "",
+    visual_facts: dict | None = None,
 ) -> Path:
     """Normalize, validate, and write one timestamped metadata JSON file."""
     normalized = enforce_limits(result)
     errors = validate_metadata(normalized) + validate_metadata_quality(normalized)
+    if visual_facts is not None:
+        from visual_facts import (
+            validate_metadata_against_visual_facts,
+            validate_visual_facts,
+        )
+
+        errors += validate_visual_facts(visual_facts)
+        errors += validate_metadata_against_visual_facts(
+            normalized, visual_facts
+        )
     if errors:
         raise ValueError("; ".join(errors))
     if visual_review_status not in {"unreviewed", "verified"}:
@@ -728,6 +751,11 @@ def write_metadata(
         "quality_warnings": assess_metadata_quality(normalized),
         **normalized,
     }
+    if visual_facts is not None:
+        from visual_facts import normalize_visual_facts, visual_facts_sha256
+
+        payload["visual_facts"] = normalize_visual_facts(visual_facts)
+        payload["visual_facts_sha256"] = visual_facts_sha256(visual_facts)
     out_file.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",

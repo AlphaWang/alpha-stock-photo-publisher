@@ -22,6 +22,13 @@ from metadata_core import (
     validate_metadata,
     validate_metadata_quality,
 )
+from visual_facts import (
+    normalize_visual_facts,
+    validate_metadata_against_visual_facts,
+    validate_visual_fact_batch,
+    validate_visual_facts,
+    visual_facts_sha256,
+)
 from upload.status import UploadStatus
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
@@ -138,6 +145,20 @@ def _validate_metadata_binding(
 
     normalized = enforce_limits(metadata)
     errors = validate_metadata(normalized) + validate_metadata_quality(normalized)
+    visual_facts = metadata.get("visual_facts")
+    if (
+        metadata.get("visual_review_method") == "agent-native"
+        and not isinstance(visual_facts, dict)
+    ):
+        errors.append(
+            "agent-native verified metadata is missing machine-readable visual facts"
+        )
+    if visual_facts is not None:
+        errors += validate_visual_facts(visual_facts)
+        errors += validate_metadata_against_visual_facts(normalized, visual_facts)
+        expected_facts_digest = metadata.get("visual_facts_sha256")
+        if expected_facts_digest != visual_facts_sha256(visual_facts):
+            errors.append("visual facts digest does not match the metadata sidecar")
     if errors:
         raise ValueError("; ".join(errors))
     if metadata.get("visual_review_status") != "verified" and not allow_unreviewed:
@@ -145,6 +166,9 @@ def _validate_metadata_binding(
             "metadata is not visually verified; regenerate/review it or use "
             "--allow-unreviewed-metadata"
         )
+    if visual_facts is not None:
+        normalized["visual_facts"] = normalize_visual_facts(visual_facts)
+        normalized["visual_facts_sha256"] = visual_facts_sha256(visual_facts)
     return normalized
 
 
@@ -239,8 +263,46 @@ def run_upload(
             except (OSError, ValueError, json.JSONDecodeError) as error:
                 print(f"  [review] {img.name}: {error}", flush=True)
                 preflight_results[img.name] = UploadStatus.NEEDS_REVIEW
+        fact_batch_issues = validate_visual_fact_batch(
+            [
+                {
+                    "image": image.name,
+                    "metadata": metadata,
+                    "visual_facts": metadata.get("visual_facts"),
+                }
+                for image, metadata in loaded
+                if metadata.get("visual_facts") is not None
+            ],
+            require_complete_ranking=False,
+        )
+        if fact_batch_issues:
+            facts_loaded = [
+                (image, metadata)
+                for image, metadata in loaded
+                if metadata.get("visual_facts") is not None
+            ]
+            blocked = set()
+            for index, issues in sorted(fact_batch_issues.items()):
+                filename = facts_loaded[index - 1][0].name
+                blocked.add(filename)
+                print(
+                    f"  [review] {filename}: " + "; ".join(issues),
+                    flush=True,
+                )
+                preflight_results[filename] = UploadStatus.NEEDS_REVIEW
+            loaded = [
+                (image, metadata)
+                for image, metadata in loaded
+                if image.name not in blocked
+            ]
+
         repeated = find_batch_quality_issues(
-            [(image.name, metadata) for image, metadata in loaded]
+            [(image.name, metadata) for image, metadata in loaded],
+            visual_facts_by_source={
+                image.name: metadata["visual_facts"]
+                for image, metadata in loaded
+                if metadata.get("visual_facts") is not None
+            },
         )
         if repeated and not allow_repeated_metadata:
             blocked = set(repeated)

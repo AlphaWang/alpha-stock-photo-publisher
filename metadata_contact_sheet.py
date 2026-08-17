@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build filename-and-metadata contact sheets for mandatory visual review."""
+"""Build immutable visual-facts and metadata review packs."""
 
 import argparse
 import hashlib
@@ -8,6 +8,12 @@ import textwrap
 from pathlib import Path
 
 from metadata_core import METADATA_FIELDS
+from visual_facts import (
+    VISUAL_FACT_FIELDS,
+    normalize_visual_facts,
+    validate_visual_facts,
+    visual_facts_sha256,
+)
 
 
 def _sha256(path: Path) -> str:
@@ -57,8 +63,9 @@ def _wrapped(label: str, value: object, *, width: int = 132) -> list[str]:
     ) or [f"{label}: (empty)"]
 
 
-def _metadata_lines(source: Path, metadata: dict) -> list[str]:
+def _metadata_lines(source: Path, visual_facts: dict, metadata: dict) -> list[str]:
     lines = [source.name]
+    lines.extend(_wrapped("VISUAL FACTS", normalize_visual_facts(visual_facts)))
     fields = (
         ("Title EN", "title_en"),
         ("Title ZH", "title_zh"),
@@ -119,9 +126,20 @@ def build_contact_sheets(preview_manifest: Path, metadata_manifest: Path) -> Pat
         )
         if source in previews:
             raise ValueError(f"duplicate preview source: {source}")
-        previews[source] = _resolve_path(
-            item.get("preview"), preview_manifest.parent
-        )
+        preview = _resolve_path(item.get("preview"), preview_manifest.parent)
+        details = item.get("detail_previews", [])
+        if not isinstance(details, list):
+            raise ValueError("preview detail_previews must be an array")
+        if len(details) != 4:
+            raise ValueError(
+                "review packs require exactly four overlapping detail previews"
+            )
+        previews[source] = {
+            "preview": preview,
+            "details": [
+                _resolve_path(detail, preview_manifest.parent) for detail in details
+            ],
+        }
 
     records = []
     seen = set()
@@ -136,10 +154,29 @@ def build_contact_sheets(preview_manifest: Path, metadata_manifest: Path) -> Pat
         if source in seen:
             raise ValueError(f"duplicate metadata source: {source}")
         seen.add(source)
-        preview = previews.get(source)
-        if preview is None or not preview.is_file():
+        visual_facts = item.get("visual_facts")
+        fact_errors = validate_visual_facts(visual_facts)
+        if fact_errors:
+            raise ValueError(
+                f"invalid visual facts for {source}: " + "; ".join(fact_errors)
+            )
+        prepared = previews.get(source)
+        if prepared is None or not prepared["preview"].is_file():
             raise ValueError(f"no prepared preview for metadata source: {source}")
-        records.append((Path(source), preview, item["metadata"]))
+        missing_details = [
+            detail for detail in prepared["details"] if not detail.is_file()
+        ]
+        if missing_details:
+            raise ValueError(f"prepared detail preview is missing: {missing_details[0]}")
+        records.append(
+            (
+                Path(source),
+                prepared["preview"],
+                prepared["details"],
+                visual_facts,
+                item["metadata"],
+            )
+        )
 
     unmatched = sorted(set(previews) - seen)
     if unmatched:
@@ -150,7 +187,7 @@ def build_contact_sheets(preview_manifest: Path, metadata_manifest: Path) -> Pat
         raise ValueError("no matched preview and metadata records")
 
     metadata_digest = _sha256(metadata_manifest)
-    output_dir = preview_manifest.parent / f"metadata-audit-{metadata_digest[:12]}"
+    output_dir = preview_manifest.parent / f"metadata-review-{metadata_digest[:12]}"
     output_dir.mkdir(exist_ok=True)
     font = _audit_font(ImageFont)
     sheet_paths = []
@@ -163,15 +200,18 @@ def build_contact_sheets(preview_manifest: Path, metadata_manifest: Path) -> Pat
     for page, start in enumerate(range(0, len(records), per_sheet), 1):
         page_records = records[start : start + per_sheet]
         line_count = max(
-            len(_metadata_lines(source, metadata))
-            for source, _preview, metadata in page_records
+            len(_metadata_lines(source, visual_facts, metadata))
+            for source, _preview, _details, visual_facts, metadata in page_records
         )
-        rendered_height = max(cell_height, 710 + line_count * 18)
+        has_details = any(details for _source, _preview, details, _facts, _meta in page_records)
+        detail_height = 620 if has_details else 0
+        text_y = 670 + detail_height
+        rendered_height = max(cell_height, text_y + 40 + line_count * 18)
         sheet = Image.new(
             "RGB", (columns * cell_width, rows * rendered_height), "white"
         )
         draw = ImageDraw.Draw(sheet)
-        for offset, (source, preview, metadata) in enumerate(
+        for offset, (source, preview, details, visual_facts, metadata) in enumerate(
             page_records
         ):
             row, column = divmod(offset, columns)
@@ -180,34 +220,71 @@ def build_contact_sheets(preview_manifest: Path, metadata_manifest: Path) -> Pat
                 image = opened.convert("RGB")
                 image.thumbnail((1160, 650))
                 sheet.paste(image, (x + (1160 - image.width) // 2 + 20, y + 5))
-            label = "\n".join(_metadata_lines(source, metadata))
+            for detail_index, detail_path in enumerate(details[:4]):
+                detail_row, detail_column = divmod(detail_index, 2)
+                with Image.open(detail_path) as opened:
+                    detail = opened.convert("RGB")
+                    detail.thumbnail((570, 290))
+                    detail_x = x + 15 + detail_column * 585
+                    detail_y = y + 670 + detail_row * 305
+                    sheet.paste(
+                        detail,
+                        (
+                            detail_x + (570 - detail.width) // 2,
+                            detail_y + (290 - detail.height) // 2,
+                        ),
+                    )
+            label = "\n".join(
+                _metadata_lines(source, visual_facts, metadata)
+            )
             draw.multiline_text(
-                (x + 18, y + 670),
+                (x + 18, y + text_y),
                 label,
                 fill="black",
                 font=font,
                 spacing=2,
             )
-        sheet_path = output_dir / f"metadata-audit-{page:03d}.jpg"
+        sheet_path = output_dir / f"metadata-review-{page:03d}.jpg"
         sheet.save(sheet_path, "JPEG", quality=90)
         sheet_paths.append(str(sheet_path))
         print(sheet_path, flush=True)
 
-    receipt = preview_manifest.parent / "metadata_audit_receipt.json"
-    receipt.write_text(
+    review_pack = preview_manifest.parent / "metadata_review_pack.json"
+    review_pack.write_text(
         json.dumps(
             {
+                "review_pack_schema_version": 3,
                 "preview_manifest": str(preview_manifest),
                 "preview_manifest_sha256": _sha256(preview_manifest),
                 "metadata_manifest": str(metadata_manifest),
                 "metadata_manifest_sha256": metadata_digest,
                 "source_count": len(records),
-                "audit_schema_version": 2,
                 "audited_fields": list(METADATA_FIELDS),
+                "visual_fact_fields": list(VISUAL_FACT_FIELDS),
                 "sheets": sheet_paths,
                 "sheet_sha256": {
                     sheet_path: _sha256(Path(sheet_path)) for sheet_path in sheet_paths
                 },
+                "items": [
+                    {
+                        "image": str(source),
+                        "preview": str(preview),
+                        "preview_sha256": _sha256(preview),
+                        "detail_previews": [str(path) for path in details],
+                        "detail_preview_sha256": {
+                            str(path): _sha256(path) for path in details
+                        },
+                        "visual_facts_sha256": visual_facts_sha256(visual_facts),
+                        "sheet": sheet_paths[index],
+                    }
+                    for index, (
+                        source,
+                        preview,
+                        details,
+                        visual_facts,
+                        _metadata,
+                    ) in enumerate(records)
+                ],
             },
             ensure_ascii=False,
             indent=2,
@@ -215,8 +292,42 @@ def build_contact_sheets(preview_manifest: Path, metadata_manifest: Path) -> Pat
         + "\n",
         encoding="utf-8",
     )
-    print(f"Audit receipt: {receipt}", flush=True)
-    return receipt
+    decisions_template = preview_manifest.parent / "metadata_review_decisions.json"
+    decisions_template.write_text(
+        json.dumps(
+            {
+                "review_decision_schema_version": 1,
+                "review_pack": str(review_pack),
+                "review_pack_sha256": _sha256(review_pack),
+                "independent_review": False,
+                "reviewer": "",
+                "reviewed_fields": [
+                    *METADATA_FIELDS,
+                    "visual_facts",
+                    "release_ip",
+                ],
+                "items": [
+                    {
+                        "image": str(source),
+                        "verdict": "pending",
+                        "visual_facts_verdict": "pending",
+                        "metadata_verdict": "pending",
+                        "release_ip_verdict": "pending",
+                        "issues": [],
+                        "reviewed_evidence": [],
+                    }
+                    for source, _preview, _details, _facts, _metadata in records
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    print(f"Review pack: {review_pack}", flush=True)
+    print(f"Decision template: {decisions_template}", flush=True)
+    return review_pack
 
 
 def main() -> int:

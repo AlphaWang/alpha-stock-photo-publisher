@@ -2,6 +2,7 @@ import unittest
 
 from metadata_benchmark import evaluate_manifests, evaluate_record
 from test_metadata_core import sample_metadata
+from test_visual_facts import complete_visual_facts
 
 
 class MetadataBenchmarkTests(unittest.TestCase):
@@ -47,6 +48,16 @@ class MetadataBenchmarkTests(unittest.TestCase):
         self.assertEqual(report["passed"], 0)
         self.assertEqual(report["failed"], 2)
         self.assertIn("forbidden en term", report["results"][0]["issues"][0])
+
+    def test_evaluate_record_uses_visual_fact_grounding(self):
+        facts = complete_visual_facts()
+        facts["water_visible"] = "no"
+        metadata = sample_metadata()
+        metadata["description_en"] = "A desert road follows a lake at sunset."
+
+        issues = evaluate_record(metadata, {"visual_facts": facts})
+
+        self.assertTrue(any("water_visible=no" in issue for issue in issues))
 
 
 if __name__ == "__main__":

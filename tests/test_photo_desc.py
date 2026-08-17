@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from photo_desc import main, process_one, verify_metadata
+from test_visual_facts import complete_visual_facts
 
 
 def complete_metadata():
@@ -35,6 +36,15 @@ def complete_metadata():
     }
 
 
+def mountain_visual_facts():
+    return {
+        **complete_visual_facts(),
+        "primary_subjects_en": ["mountain"],
+        "primary_subjects_zh": ["山峰"],
+        "scene_signature": "mountain-meadow",
+    }
+
+
 class PhotoDescriptionTests(unittest.TestCase):
     def test_visual_verifier_uses_crops_without_shooting_context(self):
         captured = {}
@@ -50,7 +60,16 @@ class PhotoDescriptionTests(unittest.TestCase):
                             type(
                                 "Block",
                                 (),
-                                {"type": "text", "text": '{"verdict":"pass","issues":[]}'},
+                                {
+                                    "type": "text",
+                                    "text": json.dumps(
+                                        {
+                                            "verdict": "pass",
+                                            "issues": [],
+                                            "visual_facts": mountain_visual_facts(),
+                                        }
+                                    ),
+                                },
                             )()
                         ]
                     },
@@ -62,7 +81,7 @@ class PhotoDescriptionTests(unittest.TestCase):
                 "photo_desc.load_image_crops",
                 return_value=[("crop-1", "image/jpeg"), ("crop-2", "image/jpeg")],
             ):
-                passed, issues = verify_metadata(
+                passed, issues, visual_facts = verify_metadata(
                     Path("photo.jpg"),
                     complete_metadata(),
                     client,
@@ -71,6 +90,7 @@ class PhotoDescriptionTests(unittest.TestCase):
 
         self.assertTrue(passed)
         self.assertEqual(issues, [])
+        self.assertEqual(visual_facts["primary_subjects_en"], ["mountain"])
         content = captured["messages"][0]["content"]
         self.assertEqual(sum(item["type"] == "image" for item in content), 3)
         self.assertNotIn("SECRET SHOOTING CONTEXT", str(content))
@@ -82,7 +102,10 @@ class PhotoDescriptionTests(unittest.TestCase):
             image.write_bytes(b"image-content")
 
             with patch("photo_desc.analyze_image", return_value=complete_metadata()):
-                with patch("photo_desc.verify_metadata", return_value=(True, [])):
+                with patch(
+                    "photo_desc.verify_metadata",
+                    return_value=(True, [], mountain_visual_facts()),
+                ):
                     _, ok, output = process_one(image, directory, object())
 
             self.assertTrue(ok)
@@ -91,6 +114,7 @@ class PhotoDescriptionTests(unittest.TestCase):
             self.assertEqual(
                 payload["visual_review_method"], "anthropic-second-pass"
             )
+            self.assertIn("visual_facts_sha256", payload)
 
     def test_process_one_does_not_write_after_two_failed_reviews(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -101,7 +125,7 @@ class PhotoDescriptionTests(unittest.TestCase):
             with patch("photo_desc.analyze_image", return_value=complete_metadata()):
                 with patch(
                     "photo_desc.verify_metadata",
-                    return_value=(False, ["lake is not visible"]),
+                    return_value=(False, ["lake is not visible"], None),
                 ):
                     _, ok, error = process_one(image, directory, object())
 
@@ -117,7 +141,10 @@ class PhotoDescriptionTests(unittest.TestCase):
                 image.touch()
 
             def generated(image, _client, _context):
-                return image, True, complete_metadata()
+                return image, True, {
+                    "metadata": complete_metadata(),
+                    "visual_facts": complete_visual_facts(),
+                }
 
             with patch("photo_desc.make_client", return_value=object()):
                 with patch("photo_desc.generate_one", side_effect=generated):

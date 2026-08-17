@@ -35,6 +35,12 @@ from metadata_core import (
     validate_metadata_quality,
     write_metadata,
 )
+from visual_facts import (
+    normalize_visual_facts,
+    validate_metadata_against_visual_facts,
+    validate_visual_fact_batch,
+    validate_visual_facts,
+)
 
 try:
     from dotenv import load_dotenv
@@ -248,7 +254,7 @@ def analyze_image(
 
 def verify_metadata(
     image_path: Path, metadata: dict, client, context: str = ""
-) -> tuple[bool, list[str]]:
+) -> tuple[bool, list[str], dict | None]:
     """Run a context-isolated visual-grounding pass with detailed crops."""
     data, media_type = load_image(image_path, max_edge=1536, quality=78)
     image_blocks = [
@@ -277,7 +283,7 @@ def verify_metadata(
         try:
             response = client.messages.create(
                 model=get_verifier_model(),
-                max_tokens=1024,
+                max_tokens=2048,
                 system=(
                     "You are a stock-photo metadata verifier. The first image is a full "
                     "preview and any following images are overlapping crops of the same "
@@ -289,9 +295,23 @@ def verify_metadata(
                     "EXIF, or manual need not be visually provable, but they must not make a "
                     "nonvisible subject appear visible in a title or description. Fail "
                     "material omissions of the primary commercial subject, bilingual "
-                    "contradictions, or any invented visual claim. Return strict JSON only as "
-                    "{\"verdict\":\"pass\",\"issues\":[]} or "
-                    "{\"verdict\":\"fail\",\"issues\":[\"specific correction\"]}."
+                    "contradictions, or any invented visual claim. On a pass, also produce "
+                    "a complete visual_facts object using visual_facts_contract.json semantics. "
+                    "Every observation is yes, no, or unknown; selection_status is selected; "
+                    "scene_signature is concise and visual; required_terms name commercially "
+                    "important visible details that metadata must retain; forbidden_claims name "
+                    "likely but absent/misidentified subjects. Return strict JSON only with keys "
+                    "verdict, issues, and visual_facts. visual_facts must contain: schema_version, "
+                    "primary_subjects_en, primary_subjects_zh, required_terms_en, required_terms_zh, "
+                    "forbidden_claims_en, forbidden_claims_zh, water_visible, trail_visible, "
+                    "people_visible, recognizable_people_visible, structures_visible, "
+                    "vehicles_visible, animals_visible, reflection_visible, text_visible, "
+                    "logo_or_trademark_visible, copyrighted_content_visible, "
+                    "private_property_visible, copy_space_visible, scene_signature, "
+                    "burst_group_id, burst_rank, technical_quality, commercial_potential, "
+                    "commercial_strengths_en, selection_status, and uncertain_details. "
+                    "technical_quality must be pass, commercial_potential must be high or "
+                    "medium, and burst_rank is 0 unless a burst group is known."
                 ),
                 messages=[
                     {
@@ -327,7 +347,17 @@ def verify_metadata(
         raise ValueError("visual verifier verdict must be pass or fail")
     if verdict == "fail" and not issues:
         issues = ["visual verifier rejected the metadata without details"]
-    return verdict == "pass", issues
+    visual_facts = result.get("visual_facts")
+    if verdict == "pass":
+        fact_issues = validate_visual_facts(visual_facts)
+        if not fact_issues:
+            fact_issues = validate_metadata_against_visual_facts(
+                metadata, visual_facts
+            )
+        if fact_issues:
+            return False, fact_issues, None
+        return True, issues, normalize_visual_facts(visual_facts)
+    return False, issues, None
 
 
 def generate_one(
@@ -335,6 +365,7 @@ def generate_one(
 ) -> tuple[Path, bool, object]:
     try:
         result = enforce_limits(analyze_image(image_path, client, context))
+        visual_facts = None
         for review_attempt in range(2):
             static_issues = (
                 validate_metadata(result)
@@ -343,7 +374,9 @@ def generate_one(
             if static_issues:
                 passed, issues = False, static_issues
             else:
-                passed, issues = verify_metadata(image_path, result, client, context)
+                passed, issues, visual_facts = verify_metadata(
+                    image_path, result, client, context
+                )
             if passed:
                 break
             if review_attempt == 1:
@@ -358,7 +391,10 @@ def generate_one(
                     revision_feedback="; ".join(issues),
                 )
             )
-        return image_path, True, result
+        return image_path, True, {
+            "metadata": result,
+            "visual_facts": visual_facts,
+        }
     except Exception as error:
         return image_path, False, str(error)
 
@@ -371,11 +407,12 @@ def process_one(
         return image_path, False, str(result)
     try:
         out_file = write_metadata(
-            result,
+            result["metadata"],
             image_path,
             output_dir,
             visual_review_status="verified",
             visual_review_method="anthropic-second-pass",
+            visual_facts=result["visual_facts"],
         )
         return image_path, True, str(out_file)
     except Exception as error:
@@ -453,9 +490,26 @@ def main() -> int:
                 print(f"[{done}/{total}] failed {img.name}: {result}")
 
     repeated = find_batch_quality_issues(
-        [(str(image), metadata) for image, metadata in generated]
+        [
+            (str(image), result["metadata"])
+            for image, result in generated
+        ],
+        visual_facts_by_source={
+            str(image): result["visual_facts"]
+            for image, result in generated
+        },
     )
-    for image, metadata in generated:
+    fact_batch_issues = validate_visual_fact_batch(
+        [
+            {
+                "image": str(image),
+                "metadata": result["metadata"],
+                "visual_facts": result["visual_facts"],
+            }
+            for image, result in generated
+        ]
+    )
+    for generated_index, (image, result) in enumerate(generated, 1):
         if str(image) in repeated:
             failed.append(image.name)
             print(
@@ -463,13 +517,21 @@ def main() -> int:
                 + "; ".join(repeated[str(image)])
             )
             continue
+        if generated_index in fact_batch_issues:
+            failed.append(image.name)
+            print(
+                f"[batch] failed {image.name}: "
+                + "; ".join(fact_batch_issues[generated_index])
+            )
+            continue
         try:
             out_file = write_metadata(
-                metadata,
+                result["metadata"],
                 image,
                 output_for(image),
                 visual_review_status="verified",
                 visual_review_method="anthropic-second-pass",
+                visual_facts=result["visual_facts"],
             )
             print(f"wrote {image.name} -> {out_file.name}")
         except Exception as error:

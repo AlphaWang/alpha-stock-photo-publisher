@@ -2,14 +2,12 @@
 """Validate agent-generated stock metadata and write timestamped JSON files."""
 
 import argparse
-import hashlib
 import json
 import sys
 from pathlib import Path
 from typing import Optional
 
 from metadata_core import (
-    METADATA_FIELDS,
     SUPPORTED_EXTS,
     assess_metadata_quality,
     enforce_limits,
@@ -17,6 +15,13 @@ from metadata_core import (
     validate_metadata,
     validate_metadata_quality,
     write_metadata,
+)
+from metadata_review_finalize import verify_audit_receipt
+from visual_facts import (
+    normalize_visual_facts,
+    validate_metadata_against_visual_facts,
+    validate_visual_fact_batch,
+    validate_visual_facts,
 )
 
 
@@ -43,6 +48,7 @@ def _write_one(
     *,
     visual_review_status: str,
     visual_review_method: str,
+    visual_facts: dict | None = None,
 ) -> Path:
     destination = output_dir or image.parent
     destination.mkdir(parents=True, exist_ok=True)
@@ -52,6 +58,7 @@ def _write_one(
         destination,
         visual_review_status=visual_review_status,
         visual_review_method=visual_review_method,
+        visual_facts=visual_facts,
     )
 
 
@@ -82,7 +89,7 @@ def main() -> int:
     parser.add_argument(
         "--audit-receipt",
         type=Path,
-        help="Receipt from metadata_contact_sheet.py required for agent-native review",
+        help="Receipt from metadata_review_finalize.py required for agent-native review",
     )
     parser.add_argument(
         "--strict-quality",
@@ -129,47 +136,10 @@ def main() -> int:
             parser.error("agent-native audit receipts require --manifest mode")
         try:
             receipt_path = args.audit_receipt.expanduser().resolve()
-            receipt = _load_json(receipt_path)
-            if not isinstance(receipt, dict):
-                parser.error("audit receipt must contain a JSON object")
-            expected = hashlib.sha256(input_path.read_bytes()).hexdigest()
-            if receipt.get("metadata_manifest_sha256") != expected:
-                parser.error("audit receipt does not match the metadata manifest")
-            if receipt.get("source_count") != len(items):
-                parser.error("audit receipt source count does not match the manifest")
-            if receipt.get("audit_schema_version") != 2:
-                parser.error("audit receipt does not cover the complete metadata schema")
-            audited_fields = receipt.get("audited_fields", [])
-            if not isinstance(audited_fields, list) or not set(
-                METADATA_FIELDS
-            ).issubset(set(audited_fields)):
-                parser.error("audit receipt is missing required audited fields")
-            preview_manifest = Path(
-                str(receipt.get("preview_manifest", ""))
-            ).expanduser().resolve()
-            if not preview_manifest.is_file():
-                parser.error("audit receipt preview manifest is missing")
-            preview_digest = hashlib.sha256(preview_manifest.read_bytes()).hexdigest()
-            if receipt.get("preview_manifest_sha256") != preview_digest:
-                parser.error("audit receipt preview manifest has changed")
-            sheets = receipt.get("sheets", [])
-            if not isinstance(sheets, list) or not all(
-                isinstance(sheet, str) and sheet for sheet in sheets
-            ):
-                parser.error("audit receipt contact sheet list is invalid")
-            resolved_sheets = [
-                Path(str(sheet)).expanduser().resolve() for sheet in sheets
-            ]
-            if not sheets or not all(sheet.is_file() for sheet in resolved_sheets):
-                parser.error("audit receipt contact sheets are missing")
-            sheet_hashes = receipt.get("sheet_sha256", {})
-            if not isinstance(sheet_hashes, dict) or any(
-                sheet_hashes.get(sheet)
-                != hashlib.sha256(resolved.read_bytes()).hexdigest()
-                for sheet, resolved in zip(sheets, resolved_sheets)
-            ):
-                parser.error("audit receipt contact sheets have changed")
+            verify_audit_receipt(receipt_path, input_path)
         except (OSError, json.JSONDecodeError) as error:
+            parser.error(str(error))
+        except ValueError as error:
             parser.error(str(error))
 
     prepared = []
@@ -185,8 +155,24 @@ def main() -> int:
             metadata = item.get("metadata")
             if not isinstance(metadata, dict):
                 raise ValueError("metadata must be a JSON object")
+            visual_facts = item.get("visual_facts")
+            facts_required = (
+                args.visual_reviewed and args.review_method == "agent-native"
+            )
+            if facts_required and not isinstance(visual_facts, dict):
+                raise ValueError(
+                    "agent-native verified metadata requires visual_facts"
+                )
+            if visual_facts is not None:
+                fact_errors = validate_visual_facts(visual_facts)
+                if fact_errors:
+                    raise ValueError("; ".join(fact_errors))
             normalized = enforce_limits(metadata)
             errors = validate_metadata(normalized) + validate_metadata_quality(normalized)
+            if visual_facts is not None:
+                errors += validate_metadata_against_visual_facts(
+                    normalized, visual_facts
+                )
             warnings = assess_metadata_quality(normalized)
             if warnings:
                 print(
@@ -196,7 +182,16 @@ def main() -> int:
                 )
             if errors:
                 raise ValueError("; ".join(errors))
-            prepared.append((index, image, normalized))
+            prepared.append(
+                (
+                    index,
+                    image,
+                    normalized,
+                    normalize_visual_facts(visual_facts)
+                    if visual_facts is not None
+                    else None,
+                )
+            )
         except (OSError, ValueError, json.JSONDecodeError) as e:
             failures.append(index)
             print(f"[{index}/{len(items)}] failed: {e}", file=sys.stderr, flush=True)
@@ -205,8 +200,24 @@ def main() -> int:
         print(f"Failed manifest items: {failures}", file=sys.stderr)
         return 1
 
+    fact_batch_issues = validate_visual_fact_batch(items)
+    if fact_batch_issues:
+        for index, issues in sorted(fact_batch_issues.items()):
+            print(
+                f"[batch] failed item {index}: " + "; ".join(issues),
+                file=sys.stderr,
+                flush=True,
+            )
+        return 1
+
+    visual_facts_by_source = {
+        str(image): facts
+        for _index, image, _metadata, facts in prepared
+        if facts is not None
+    }
     repeated = find_batch_quality_issues(
-        [(str(image), metadata) for _, image, metadata in prepared]
+        [(str(image), metadata) for _, image, metadata, _facts in prepared],
+        visual_facts_by_source=visual_facts_by_source,
     )
     if repeated and not args.allow_repeated_metadata:
         for source, issues in sorted(repeated.items()):
@@ -224,7 +235,7 @@ def main() -> int:
 
     review_status = "verified" if args.visual_reviewed else "unreviewed"
     review_method = args.review_method if args.visual_reviewed else ""
-    for index, image, metadata in prepared:
+    for index, image, metadata, visual_facts in prepared:
         try:
             out_file = _write_one(
                 image,
@@ -232,6 +243,7 @@ def main() -> int:
                 output_dir,
                 visual_review_status=review_status,
                 visual_review_method=review_method,
+                visual_facts=visual_facts,
             )
             print(f"[{index}/{len(items)}] wrote {out_file}", flush=True)
         except (OSError, ValueError) as error:

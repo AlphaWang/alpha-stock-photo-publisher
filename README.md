@@ -72,11 +72,11 @@ Open this project in [Claude Code](https://claude.ai/code) and run:
 
 Both agent skills follow the same workflow:
 
-1. Create temporary 1024px previews and generate per-image visual facts and metadata
-2. Build one-image audit sheets showing every English/Chinese field and keyword
-3. Run strict batch validation, then write SHA-bound metadata marked as visually verified
-4. Remove the previews and audit sheets
-5. Upload only when explicitly requested, with another quality and review-status preflight
+1. Create 1536px overviews plus four overlapping detail crops
+2. Record machine-readable visual facts before generating buyer metadata
+3. Build immutable one-image review sheets and record independent per-image decisions
+4. Issue a v3 audit receipt, then write SHA-bound, fact-bound metadata
+5. Curate near-identical bursts and upload only when explicitly requested
 
 Existing JSON is reused only when it is SHA-bound, visually verified, and passes
 the current quality checks. Merely having a JSON file no longer counts as a
@@ -97,14 +97,15 @@ This path requires the optional Anthropic dependencies and credentials above. It
 uses a 1024px generation preview followed by a context-isolated 1536px visual
 verification pass with overlapping crops for small text, logos, and people. Set
 `ANTHROPIC_VERIFIER_MODEL` to use a separately configured verifier model. A rejected draft is regenerated once, and the completed batch
-is checked for repeated titles and descriptions before any repeated records are
-written. Metadata is not written when the second verification still fails. This
+is checked against a full visual-facts object and for repeated titles and
+descriptions before records are written. Metadata is not written when the second
+verification still fails. This
 path is not used by the normal Codex or Claude native workflow.
 
 ### Prepare previews manually
 
 ```bash
-python3 prepare_images.py /path/to/dir
+python3 prepare_images.py /path/to/dir --max-edge 1536 --detail-crops
 python3 prepare_images.py --cleanup /tmp/stock-photo-previews-abc123/preview_manifest.json
 ```
 
@@ -112,8 +113,9 @@ The command prints the exact manifest path. Pass that path back to `--cleanup`; 
 
 ### Audit and write native-agent metadata manually
 
-After creating a temporary metadata manifest, build contact sheets that bind each
-preview to its proposed title, description, keywords, and release assessment:
+After creating a temporary manifest containing `visual_facts` that satisfies
+`visual_facts_contract.json`, build a review pack that binds each overview, detail
+crop, facts object, metadata object, and review sheet by SHA-256:
 
 ```bash
 python3 metadata_contact_sheet.py \
@@ -121,9 +123,19 @@ python3 metadata_contact_sheet.py \
   --metadata-manifest /tmp/proposed-metadata.json
 ```
 
-Inspect every reported sheet. Each sheet contains one image plus every bilingual
-title, description, keyword, platform category, location-evidence field, commercial
-use, and release/IP field. Then use its receipt to write verified metadata:
+The command produces `metadata_review_pack.json` and a pending
+`metadata_review_decisions.json`; it does not claim that review happened. Inspect
+every sheet in a fresh pass, then mark each image's facts, metadata, release/IP,
+and overall verdict as `pass`, record the overview/detail evidence, and finalize:
+
+```bash
+python3 metadata_review_finalize.py \
+  --review-pack /tmp/stock-photo-previews-abc123/metadata_review_pack.json \
+  --decisions /tmp/stock-photo-previews-abc123/metadata_review_decisions.json
+```
+
+The finalizer refuses missing, failed, incomplete, or changed review artifacts.
+Use the resulting v3 receipt to write verified metadata:
 
 ```bash
 python3 metadata_writer.py \
@@ -134,10 +146,12 @@ python3 metadata_writer.py \
   --audit-receipt /tmp/stock-photo-previews-abc123/metadata_audit_receipt.json
 ```
 
-The writer validates the entire manifest before writing any file. Repeated titles
-or descriptions, repeated factual leads, generic filler, irrelevant first keywords,
-word-stem spam, unsupported locations, release-status contradictions, invalid
-platform categories, and changed or incomplete audit artifacts block the batch.
+The writer validates the entire manifest before writing any file. Incomplete facts,
+facts/metadata contradictions, weak technical selections, more than three selected
+frames per burst, generic filler, irrelevant first keywords, word-stem spam,
+unsupported locations, release contradictions, invalid categories, and changed or
+incomplete audit artifacts block the batch. Exact copy is permitted only for a
+small, explicitly ranked same-scene burst, avoiding artificial adjective rotation.
 Counts below 15 English or 8 Chinese keywords are advisory only; never pad metadata
 with weak terms to silence an advisory.
 
@@ -154,7 +168,8 @@ python3 metadata_benchmark.py \
 Each expected item uses the same `image` value and an `expected` object containing
 any of `required_terms_en`, `forbidden_terms_en`, `required_terms_zh`,
 `forbidden_terms_zh`, `first10_terms_en`, `category1`, and the structured
-release/IP fields. The command reports per-image failures and an aggregate pass
+release/IP fields. `expected.visual_facts` additionally runs deterministic visual
+grounding checks. The command reports per-image failures and an aggregate pass
 rate, so prompt or model changes can be measured on real labeled photos.
 
 ### Upload manually
@@ -198,6 +213,37 @@ Each image produces a timestamped JSON file alongside it, e.g. `DSC00012.jpg_202
   "visual_review_method": "agent-native",
   "visual_reviewed_at": "2026-04-18 13:31:02",
   "quality_warnings": [],
+  "visual_facts_sha256": "...",
+  "visual_facts": {
+    "schema_version": 1,
+    "primary_subjects_en": ["mountain cabin"],
+    "primary_subjects_zh": ["山间木屋"],
+    "required_terms_en": [],
+    "required_terms_zh": [],
+    "forbidden_claims_en": ["barn", "lake", "trail"],
+    "forbidden_claims_zh": ["谷仓", "湖泊", "步道"],
+    "water_visible": "no",
+    "trail_visible": "no",
+    "people_visible": "no",
+    "recognizable_people_visible": "no",
+    "structures_visible": "yes",
+    "vehicles_visible": "no",
+    "animals_visible": "no",
+    "reflection_visible": "no",
+    "text_visible": "no",
+    "logo_or_trademark_visible": "no",
+    "copyrighted_content_visible": "no",
+    "private_property_visible": "unknown",
+    "copy_space_visible": "yes",
+    "scene_signature": "single-cabin-meadow-mountain-background",
+    "burst_group_id": "",
+    "burst_rank": 0,
+    "technical_quality": "pass",
+    "commercial_potential": "medium",
+    "commercial_strengths_en": ["clear rustic travel concept"],
+    "selection_status": "selected",
+    "uncertain_details": ["property ownership cannot be determined visually"]
+  },
   "title_en": "...",
   "title_zh": "...",
   "description_en": "...",
@@ -219,19 +265,19 @@ Each image produces a timestamped JSON file alongside it, e.g. `DSC00012.jpg_202
   "core_keywords_zh": ["..."],
   "commercial_uses_en": ["travel marketing"],
   "model_release_status": "not_required",
-  "property_release_status": "not_required",
+  "property_release_status": "unknown",
   "logo_trademark_status": "none",
   "copyrighted_content_status": "none",
-  "commercial_eligibility": "clear",
-  "release_status": "clear",
-  "release_notes": ""
+  "commercial_eligibility": "review",
+  "release_status": "unknown",
+  "release_notes": "Property release status requires manual review."
 }
 ```
 
 If you run metadata generation on the same image twice, the newest JSON is used
 automatically. Upload verifies the exact filename, SHA-256, metadata contract,
-critical quality rules, commercial eligibility, batch uniqueness, and visual-review
-status before opening a browser.
+visual-facts digest and contradictions, critical quality rules, commercial
+eligibility, batch uniqueness, and visual-review status before opening a browser.
 
 ## Platform limits (enforced automatically)
 

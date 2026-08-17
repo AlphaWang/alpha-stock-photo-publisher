@@ -70,13 +70,41 @@ def _make_output_dir(output: Path = None) -> Path:
     return directory
 
 
-def prepare_previews(target: Path, output: Path = None, max_edge: int = 1024, quality: int = 80):
+def _detail_boxes(width: int, height: int):
+    overlap_x = max(1, width // 12)
+    overlap_y = max(1, height // 12)
+    mid_x, mid_y = width // 2, height // 2
+    return (
+        (0, 0, min(width, mid_x + overlap_x), min(height, mid_y + overlap_y)),
+        (max(0, mid_x - overlap_x), 0, width, min(height, mid_y + overlap_y)),
+        (0, max(0, mid_y - overlap_y), min(width, mid_x + overlap_x), height),
+        (
+            max(0, mid_x - overlap_x),
+            max(0, mid_y - overlap_y),
+            width,
+            height,
+        ),
+    )
+
+
+def prepare_previews(
+    target: Path,
+    output: Path = None,
+    max_edge: int = 1024,
+    quality: int = 80,
+    *,
+    detail_crops: bool = False,
+    detail_max_edge: int = 1024,
+):
     Image, ImageOps = _load_pillow()
     images = collect_images(target)
     directory = _make_output_dir(output)
     items = []
     errors = []
     resampling = getattr(Image, "Resampling", Image).LANCZOS
+    detail_dir = directory / "details"
+    if detail_crops:
+        detail_dir.mkdir()
 
     for index, source in enumerate(images, 1):
         preview = directory / f"{index:04d}_{_safe_stem(source)}.jpg"
@@ -86,13 +114,31 @@ def prepare_previews(target: Path, output: Path = None, max_edge: int = 1024, qu
                 image = ImageOps.exif_transpose(opened)
                 original_size = image.size
                 image = _to_rgb(image, Image)
-                image.thumbnail((max_edge, max_edge), resampling)
-                preview_size = image.size
-                image.save(preview, "JPEG", quality=quality, optimize=True)
+                preview_image = image.copy()
+                preview_image.thumbnail((max_edge, max_edge), resampling)
+                preview_size = preview_image.size
+                preview_image.save(preview, "JPEG", quality=quality, optimize=True)
+                detail_previews = []
+                if detail_crops:
+                    for crop_index, box in enumerate(
+                        _detail_boxes(*image.size), 1
+                    ):
+                        detail = image.crop(box)
+                        detail.thumbnail(
+                            (detail_max_edge, detail_max_edge), resampling
+                        )
+                        detail_path = detail_dir / (
+                            f"{index:04d}_{_safe_stem(source)}_detail-{crop_index}.jpg"
+                        )
+                        detail.save(
+                            detail_path, "JPEG", quality=quality, optimize=True
+                        )
+                        detail_previews.append(str(detail_path))
             items.append(
                 {
                     "source": str(source),
                     "preview": str(preview),
+                    "detail_previews": detail_previews,
                     "original_size": list(original_size),
                     "preview_size": list(preview_size),
                 }
@@ -111,7 +157,12 @@ def prepare_previews(target: Path, output: Path = None, max_edge: int = 1024, qu
         json.dumps(
             {
                 "generated_at": datetime.now(timezone.utc).isoformat(),
-                "settings": {"max_edge": max_edge, "jpeg_quality": quality},
+                "settings": {
+                    "max_edge": max_edge,
+                    "jpeg_quality": quality,
+                    "detail_crops": detail_crops,
+                    "detail_max_edge": detail_max_edge,
+                },
                 "items": items,
                 "errors": errors,
             },
@@ -148,13 +199,26 @@ def main() -> int:
         "--quality", type=int, default=80, help="JPEG quality from 40 to 95 (default: 80)"
     )
     parser.add_argument(
+        "--detail-crops",
+        action="store_true",
+        help="Create four overlapping, metadata-free crops for small-detail review",
+    )
+    parser.add_argument(
+        "--detail-max-edge",
+        type=int,
+        default=1024,
+        help="Maximum detail-crop edge (default: 1024)",
+    )
+    parser.add_argument(
         "--cleanup", type=Path, help="Delete a preview manifest or marked preview directory"
     )
     args = parser.parse_args()
 
     if args.cleanup:
-        if args.target or args.output:
-            parser.error("target and --output cannot be used with --cleanup")
+        if args.target or args.output or args.detail_crops:
+            parser.error(
+                "target, --output, and --detail-crops cannot be used with --cleanup"
+            )
         try:
             removed = cleanup_previews(args.cleanup)
         except (OSError, ValueError) as error:
@@ -168,6 +232,8 @@ def main() -> int:
         parser.error("--max-edge must be between 256 and 2048")
     if not 40 <= args.quality <= 95:
         parser.error("--quality must be between 40 and 95")
+    if not 256 <= args.detail_max_edge <= 2048:
+        parser.error("--detail-max-edge must be between 256 and 2048")
 
     try:
         _, errors = prepare_previews(
@@ -175,6 +241,8 @@ def main() -> int:
             output=args.output,
             max_edge=args.max_edge,
             quality=args.quality,
+            detail_crops=args.detail_crops,
+            detail_max_edge=args.detail_max_edge,
         )
     except (OSError, RuntimeError, ValueError) as error:
         parser.error(str(error))

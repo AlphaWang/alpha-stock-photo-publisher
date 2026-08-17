@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from metadata_core import clean_text, enforce_limits
+from visual_facts import validate_metadata_against_visual_facts
 
 
 def _term(value: object) -> str:
@@ -60,6 +61,11 @@ def evaluate_record(metadata: dict, expected: dict) -> list[str]:
             issues.append(
                 f"{field} is {normalized.get(field)!r}, expected {expected_value!r}"
             )
+    visual_facts = expected.get("visual_facts")
+    if visual_facts is not None:
+        issues.extend(
+            validate_metadata_against_visual_facts(normalized, visual_facts)
+        )
     return issues
 
 

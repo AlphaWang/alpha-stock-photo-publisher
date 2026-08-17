@@ -1,0 +1,109 @@
+[
+  {
+    "name": "folder location must not invent visible lake",
+    "facts_patch": {"water_visible": "no"},
+    "metadata_patch": {
+      "title_en": "Jenny Lake below the Teton mountains",
+      "description_en": "Jenny Lake reflects the mountain landscape.",
+      "keywords_en": ["lake", "mountain", "reflection"],
+      "title_zh": "大提顿山下的珍妮湖",
+      "description_zh": "珍妮湖水面映照群山。",
+      "keywords_zh": ["珍妮湖", "湖泊", "山峰", "倒影"]
+    },
+    "expected_issue": "water_visible=no"
+  },
+  {
+    "name": "open ground must not become hiking trail",
+    "facts_patch": {"trail_visible": "no"},
+    "metadata_patch": {
+      "title_en": "Hiking trail through mountain grassland",
+      "description_en": "A hiking trail crosses open grassland.",
+      "keywords_en": ["hiking trail", "grassland", "mountain"],
+      "title_zh": "穿过山地草原的徒步步道",
+      "description_zh": "一条徒步步道穿过开阔草地。",
+      "keywords_zh": ["徒步步道", "草地", "山峰"]
+    },
+    "expected_issue": "trail_visible=no"
+  },
+  {
+    "name": "absent chapel must not be described",
+    "facts_patch": {"structures_visible": "no"},
+    "metadata_patch": {
+      "title_en": "Historic chapel beneath mountain peaks",
+      "description_en": "A wooden chapel stands below rugged peaks.",
+      "keywords_en": ["chapel", "mountain", "historic building"],
+      "title_zh": "山峰下的历史教堂",
+      "description_zh": "一座木制教堂坐落在群峰下。",
+      "keywords_zh": ["教堂", "山峰", "历史建筑"]
+    },
+    "expected_issue": "structures_visible=no"
+  },
+  {
+    "name": "cabin must not be mislabeled as barn",
+    "facts_patch": {
+      "primary_subjects_en": ["cabin"],
+      "primary_subjects_zh": ["木屋"],
+      "structures_visible": "yes",
+      "forbidden_claims_en": ["barn"],
+      "forbidden_claims_zh": ["谷仓"]
+    },
+    "metadata_patch": {
+      "title_en": "Rustic barn in mountain meadow",
+      "description_en": "A weathered barn stands in an open meadow.",
+      "keywords_en": ["barn", "mountain meadow", "rustic building"],
+      "title_zh": "山地草甸中的乡村谷仓",
+      "description_zh": "一座风化谷仓位于开阔草甸中。",
+      "keywords_zh": ["谷仓", "山地草甸", "乡村建筑"]
+    },
+    "expected_issue": "visually unsupported en claim: barn"
+  },
+  {
+    "name": "small aircraft must not be omitted",
+    "facts_patch": {
+      "vehicles_visible": "yes",
+      "required_terms_en": ["aircraft"],
+      "required_terms_zh": ["飞机"]
+    },
+    "metadata_patch": {},
+    "expected_issue": "required visible en term is missing: aircraft"
+  },
+  {
+    "name": "fox tracking collar must not be omitted",
+    "facts_patch": {
+      "primary_subjects_en": ["red fox"],
+      "primary_subjects_zh": ["赤狐"],
+      "animals_visible": "yes",
+      "required_terms_en": ["tracking collar"],
+      "required_terms_zh": ["追踪项圈"]
+    },
+    "metadata_patch": {
+      "title_en": "Red fox standing in summer grass",
+      "description_en": "A red fox watches from green grass.",
+      "keywords_en": ["red fox", "wildlife", "summer grass"],
+      "title_zh": "夏季草地中的赤狐",
+      "description_zh": "一只赤狐站在绿色草地中观察四周。",
+      "keywords_zh": ["赤狐", "野生动物", "夏季草地"]
+    },
+    "expected_issue": "required visible en term is missing: tracking collar"
+  },
+  {
+    "name": "visible visitors contradict no people keyword",
+    "facts_patch": {"people_visible": "yes"},
+    "metadata_patch": {
+      "keywords_en": ["desert road", "mountain", "no people"],
+      "keywords_zh": ["沙漠公路", "山峰", "无人"]
+    },
+    "expected_issue": "people_visible=yes"
+  },
+  {
+    "name": "absent reflection must not be invented",
+    "facts_patch": {"reflection_visible": "no"},
+    "metadata_patch": {
+      "description_en": "Mountain peaks are reflected in calm water.",
+      "keywords_en": ["mountain", "reflection", "calm water"],
+      "description_zh": "山峰倒影映照在平静水面。",
+      "keywords_zh": ["山峰", "倒影", "水面"]
+    },
+    "expected_issue": "reflection_visible=no"
+  }
+]

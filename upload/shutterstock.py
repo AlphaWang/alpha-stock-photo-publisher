@@ -29,7 +29,12 @@ from playwright.sync_api import BrowserContext, TimeoutError as PWTimeout
 from .browser import ensure_logged_in
 from .confirmation import wait_for_success_text
 from .status import UploadStatus
-from metadata_core import commercial_submission_review_reason, platform_category
+from metadata_core import (
+    EDITORIAL_DATE_SOURCES,
+    LOCATION_SOURCES,
+    commercial_submission_review_reason,
+    platform_category,
+)
 
 PORTFOLIO_URL = "https://submit.shutterstock.com/portfolio/not_submitted/photo"
 CORRECTION_URL = "https://submit.shutterstock.com/portfolio/recently_reviewed/photo/returned"
@@ -103,9 +108,27 @@ def _dismiss_cookie_consent(page) -> None:
             continue
 
 
+def _card_has_exact_filename(card, image_name: str) -> bool:
+    if card.get_by_text(image_name, exact=True).count() > 0:
+        return True
+    return image_name in {
+        line.strip() for line in card.inner_text().splitlines() if line.strip()
+    }
+
+
 def _find_asset_card(page, image_name: str):
-    filename = json.dumps(image_name, ensure_ascii=False)
-    return page.locator(f".MuiCard-root:has-text({filename})").first
+    """Return one exact filename match, rejecting ambiguous platform cards."""
+    cards = page.locator(".MuiCard-root")
+    matches = []
+    for index in range(cards.count()):
+        card = cards.nth(index)
+        if _card_has_exact_filename(card, image_name):
+            matches.append(card)
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"multiple Shutterstock cards have the exact filename {image_name!r}"
+        )
+    return matches[0] if matches else None
 
 
 def _canonical_category(label: str) -> str:
@@ -141,8 +164,10 @@ def _validation_payload_is_ready(payload: object) -> bool:
 
 def _correction_is_editorial_eligible(text: str) -> bool:
     normalized = " ".join(text.split()).casefold()
-    return (
-        "correction needed" in normalized
+    reason_count = re.search(r"\bcorrection needed\s*\((\d+)\)", normalized)
+    return bool(
+        reason_count
+        and int(reason_count.group(1)) == 1
         and "eligible for editorial use" in normalized
     )
 
@@ -166,6 +191,17 @@ def _submission_mode(meta: dict) -> tuple[str | None, str]:
         ]
         if missing:
             return None, "editorial metadata is missing: " + ", ".join(missing)
+        date_source = str(meta.get("editorial_date_source", "unknown")).strip().lower()
+        if date_source not in EDITORIAL_DATE_SOURCES - {"unknown"}:
+            return None, "editorial date has no evidence source"
+        location_source = str(meta.get("location_source", "unknown")).strip().lower()
+        if location_source not in LOCATION_SOURCES - {"unknown"}:
+            return None, "editorial location has no evidence source"
+        if str(meta.get("location_confidence", "unknown")).strip().lower() not in {
+            "medium",
+            "high",
+        }:
+            return None, "editorial location confidence is below medium"
         return "editorial", ""
 
     reason = commercial_submission_review_reason(meta)
@@ -255,9 +291,43 @@ def _set_usage(page, usage: str) -> bool:
     return control.get_attribute("aria-pressed") == "true"
 
 
+def _normalized_keyword_values(values) -> list[str]:
+    return [
+        " ".join(str(value).split()).casefold()
+        for value in values
+        if " ".join(str(value).split())
+    ]
+
+
+def _selected_keyword_values(page) -> list[str]:
+    chips = page.locator("form [data-testid^='selected-keyword-']")
+    return _normalized_keyword_values(
+        chips.nth(index).inner_text() for index in range(chips.count())
+    )
+
+
+def _wait_for_selected_keywords(
+    page,
+    expected: list[str],
+    *,
+    timeout_ms: int = 5_000,
+) -> list[str]:
+    elapsed = 0
+    interval_ms = 100
+    while elapsed < timeout_ms:
+        actual = _selected_keyword_values(page)
+        if actual == expected:
+            return actual
+        page.wait_for_timeout(interval_ms)
+        elapsed += interval_ms
+    return _selected_keyword_values(page)
+
+
 def _replace_keywords(page, keywords: list[str]) -> None:
+    expected = _normalized_keyword_values(keywords)
     keyword_count = _keyword_count_from_text(page.locator("form").inner_text())
-    if keyword_count:
+    chips = page.locator("form [data-testid^='selected-keyword-']")
+    if keyword_count or chips.count() > 0:
         actions = page.locator("button[aria-label='More keyword actions']").last
         erased = False
         if actions.count() > 0:
@@ -270,19 +340,20 @@ def _replace_keywords(page, keywords: list[str]) -> None:
             ).last
             if erase.count() > 0 and erase.is_visible():
                 erase.click(timeout=5_000)
-                erased = True
+                erased = _wait_for_selected_keywords(page, []) == []
             else:
                 page.keyboard.press("Escape")
         if not erased:
-            chips = page.locator("form [data-testid^='selected-keyword-']")
             for _ in range(50):
                 if chips.count() == 0:
                     erased = True
                     break
                 before = chips.count()
                 chips.first.press("Delete")
+                page.wait_for_timeout(100)
                 if chips.count() >= before:
                     break
+            erased = _selected_keyword_values(page) == []
         if not erased:
             raise RuntimeError("existing Shutterstock keywords could not be cleared")
         # The keyword input is briefly replaced after the final chip disappears.
@@ -294,12 +365,29 @@ def _replace_keywords(page, keywords: list[str]) -> None:
     kw_input.click()
     kw_input.fill(", ".join(keywords))
     kw_input.press("Enter")
-    expected = len({str(keyword).strip().casefold() for keyword in keywords if keyword})
-    actual = _keyword_count_from_text(page.locator("form").inner_text())
+    actual = _wait_for_selected_keywords(page, expected)
     if actual != expected:
         raise RuntimeError(
-            f"Shutterstock keyword replacement produced {actual}, expected {expected}"
+            "Shutterstock keyword replacement did not preserve the expected "
+            f"ordered values: produced {actual!r}, expected {expected!r}"
         )
+
+
+def _wait_for_resubmitted_asset(
+    page,
+    image_name: str,
+    *,
+    timeout_ms: int = 10_000,
+) -> bool:
+    elapsed = 0
+    interval_ms = 250
+    while elapsed < timeout_ms:
+        card = _find_asset_card(page, image_name)
+        if card is not None and _correction_was_resubmitted(card.inner_text()):
+            return True
+        page.wait_for_timeout(interval_ms)
+        elapsed += interval_ms
+    return False
 
 
 def _fill_metadata(page, img: Path, meta: dict, *, correction: bool = False) -> bool:
@@ -384,25 +472,14 @@ def _fill_metadata(page, img: Path, meta: dict, *, correction: bool = False) -> 
     if correction:
         # A successful correction may not emit the normal validation response.
         # The returned-asset card is authoritative and changes to Resubmitted.
-        try:
-            page.wait_for_function(
-                """filename => Array.from(document.querySelectorAll('.MuiCard-root'))
-                    .some(card => card.innerText.includes(filename)
-                        && /resubmitted|已重新提交/i.test(card.innerText))""",
-                img.name,
-                timeout=10_000,
-            )
-        except PWTimeout:
-            return False
-        return _correction_was_resubmitted(_find_asset_card(page, img.name).inner_text())
+        return _wait_for_resubmitted_asset(page, img.name)
 
     if save_response is not None:
         return True
 
-    filename = json.dumps(img.name, ensure_ascii=False)
     page.wait_for_timeout(1_200)
-    card = page.locator(f".MuiCard-root:has-text({filename})").first
-    if card.count() > 0 and _asset_card_is_ready(card.inner_text()):
+    card = _find_asset_card(page, img.name)
+    if card is not None and _asset_card_is_ready(card.inner_text()):
         return True
 
     # The portfolio card can lag behind a successful save until the next reload.
@@ -426,12 +503,13 @@ def _fill_metadata(page, img: Path, meta: dict, *, correction: bool = False) -> 
     ):
         return True
 
-    try:
-        card.wait_for(state="visible", timeout=4_000)
-        if _asset_card_is_ready(card.inner_text()):
-            return True
-    except PWTimeout:
-        pass
+    if card is not None:
+        try:
+            card.wait_for(state="visible", timeout=4_000)
+            if _asset_card_is_ready(card.inner_text()):
+                return True
+        except PWTimeout:
+            pass
     if wait_for_success_text(
         page, ["saved", "changes saved", "asset saved", "已保存"], timeout=1_000
     ):
@@ -469,7 +547,7 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
         missing_pairs = []
         results: dict[str, UploadStatus] = {}
         for img, meta in pairs:
-            if _find_asset_card(page, img.name).count() > 0:
+            if _find_asset_card(page, img.name) is not None:
                 results[img.name] = UploadStatus.UPLOADED
                 print(f"  Resuming existing Shutterstock asset: {img.name}")
             else:
@@ -505,7 +583,7 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
                 try:
                     _dismiss_cookie_consent(page)
                     card = _find_asset_card(page, img.name)
-                    if card.count() == 0:
+                    if card is None:
                         raise RuntimeError("asset card was not found by exact filename")
                     if _asset_card_is_ready(card.inner_text()):
                         print(f"  ✓ Shutterstock draft already ready: {img.name}")
@@ -562,7 +640,7 @@ def repair_corrections_batch(
         for img, meta in pairs:
             try:
                 card = _find_asset_card(page, img.name)
-                if card.count() == 0:
+                if card is None:
                     print(
                         f"  [review] Shutterstock correction not found: {img.name}",
                         flush=True,

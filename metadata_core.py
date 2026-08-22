@@ -40,6 +40,7 @@ ISTOCK_CATEGORIES = [
 
 LOCATION_SOURCES = {"unknown", "context", "exif", "manual", "visible_landmark"}
 LOCATION_CONFIDENCE = {"unknown", "low", "medium", "high"}
+EDITORIAL_DATE_SOURCES = {"unknown", "context", "exif", "manual"}
 RELEASE_DOCUMENT_STATUS = {"not_required", "required", "provided", "unknown"}
 VISUAL_IP_STATUS = {"none", "visible", "unknown"}
 COMMERCIAL_ELIGIBILITY = {"clear", "review", "editorial_only"}
@@ -71,6 +72,7 @@ METADATA_FIELDS = (
     "commercial_uses_en",
     "editorial_caption_en",
     "editorial_date",
+    "editorial_date_source",
     "editorial_location_en",
     "model_release_status",
     "property_release_status",
@@ -145,6 +147,7 @@ Return strict JSON with no markdown fences and exactly these fields. Use an empt
   "commercial_uses_en": ["up to five realistic buyer use cases"],
   "editorial_caption_en": "LOCATION - D Month YYYY: factual visible description, or empty string",
   "editorial_date": "YYYY-MM-DD supported by evidence, or empty string",
+  "editorial_date_source": "unknown, context, exif, or manual",
   "editorial_location_en": "Geographic location used in the editorial caption, or empty string",
   "model_release_status": "not_required, required, provided, or unknown",
   "property_release_status": "not_required, required, provided, or unknown",
@@ -381,7 +384,26 @@ def enforce_limits(result: dict) -> dict:
     )
     normalized["location_en"] = clean_text(normalized.get("location_en", ""))
     normalized["location_zh"] = clean_text(normalized.get("location_zh", ""))
-    has_location = bool(normalized["location_en"] or normalized["location_zh"])
+    normalized["editorial_caption_en"] = clean_text(
+        normalized.get("editorial_caption_en", "")
+    )
+    normalized["editorial_date"] = clean_text(normalized.get("editorial_date", ""))
+    editorial_date_source = clean_text(
+        normalized.get("editorial_date_source", "unknown")
+    ).lower()
+    normalized["editorial_date_source"] = (
+        editorial_date_source
+        if editorial_date_source in EDITORIAL_DATE_SOURCES
+        else "unknown"
+    )
+    normalized["editorial_location_en"] = clean_text(
+        normalized.get("editorial_location_en", "")
+    )
+    has_location = bool(
+        normalized["location_en"]
+        or normalized["location_zh"]
+        or normalized["editorial_location_en"]
+    )
     location_source = clean_text(normalized.get("location_source", "unknown")).lower()
     normalized["location_source"] = (
         location_source if location_source in LOCATION_SOURCES else "unknown"
@@ -399,13 +421,6 @@ def enforce_limits(result: dict) -> dict:
         normalized["location_confidence"] = "unknown"
     normalized["commercial_uses_en"] = normalize_keywords(
         normalized.get("commercial_uses_en", []), limit=0
-    )
-    normalized["editorial_caption_en"] = clean_text(
-        normalized.get("editorial_caption_en", "")
-    )
-    normalized["editorial_date"] = clean_text(normalized.get("editorial_date", ""))
-    normalized["editorial_location_en"] = clean_text(
-        normalized.get("editorial_location_en", "")
     )
 
     structured_release_fields = (
@@ -660,8 +675,24 @@ def validate_metadata_quality(result: dict) -> list[str]:
             errors.append("editorial-only metadata requires editorial_caption_en")
         if not date_value:
             errors.append("editorial-only metadata requires editorial_date")
+        if result.get("editorial_date_source") not in {
+            "context",
+            "exif",
+            "manual",
+        }:
+            errors.append(
+                "editorial-only metadata requires a known editorial_date_source"
+            )
         if not location:
             errors.append("editorial-only metadata requires editorial_location_en")
+        if result.get("location_source") == "unknown":
+            errors.append(
+                "editorial-only metadata requires a known location_source"
+            )
+        if result.get("location_confidence") not in {"medium", "high"}:
+            errors.append(
+                "editorial-only metadata requires medium or high location_confidence"
+            )
         if caption and location and not caption.casefold().startswith(
             location.casefold() + " - "
         ):

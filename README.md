@@ -208,12 +208,16 @@ returned-items page and only automates the platform's `Eligible for Editorial
 Use` correction. Other review reasons remain manual review items.
 
 Editorial repair metadata must be SHA-bound and visually verified, with
-`commercial_eligibility: "editorial_only"` and three evidence-backed fields:
+`commercial_eligibility: "editorial_only"`, complete caption fields, and explicit
+date/location provenance:
 
 ```json
 {
   "editorial_date": "2026-06-27",
+  "editorial_date_source": "exif",
   "editorial_location_en": "Grand Teton National Park, Wyoming, USA",
+  "location_source": "context",
+  "location_confidence": "high",
   "editorial_caption_en": "Grand Teton National Park, Wyoming, USA - 27 June 2026: Kayakers cross a mountain lake below the Teton Range."
 }
 ```
@@ -296,6 +300,7 @@ Each image produces a timestamped JSON file alongside it, e.g. `DSC00012.jpg_202
   "commercial_uses_en": ["travel marketing"],
   "editorial_caption_en": "",
   "editorial_date": "",
+  "editorial_date_source": "unknown",
   "editorial_location_en": "",
   "model_release_status": "not_required",
   "property_release_status": "unknown",

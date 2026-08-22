@@ -43,7 +43,9 @@ from upload.shutterstock import (
     _canonical_category,
     _correction_is_editorial_eligible,
     _correction_was_resubmitted,
+    _find_asset_card,
     _keyword_count_from_text,
+    _replace_keywords,
     _set_usage,
     _submission_mode,
     _validation_payload_is_ready,
@@ -250,6 +252,12 @@ class UploadLogicTests(unittest.TestCase):
         self.assertFalse(
             _correction_is_editorial_eligible("Correction needed: add a release")
         )
+        self.assertFalse(
+            _correction_is_editorial_eligible(
+                "Correction needed (2) Eligible for Editorial Use "
+                "A model release is required"
+            )
+        )
 
     def test_shutterstock_correction_requires_resubmitted_card_status(self):
         self.assertTrue(
@@ -302,7 +310,10 @@ class UploadLogicTests(unittest.TestCase):
             "commercial_eligibility": "editorial_only",
             "editorial_caption_en": "",
             "editorial_date": "2026-06-27",
+            "editorial_date_source": "exif",
             "editorial_location_en": "Grand Teton National Park, Wyoming, USA",
+            "location_source": "context",
+            "location_confidence": "high",
         }
         mode, reason = _submission_mode(metadata)
         self.assertIsNone(mode)
@@ -313,6 +324,212 @@ class UploadLogicTests(unittest.TestCase):
             "Kayakers cross a mountain lake below the Teton Range."
         )
         self.assertEqual(_submission_mode(metadata), ("editorial", ""))
+
+    def test_shutterstock_editorial_mode_rejects_unknown_evidence_sources(self):
+        metadata = {
+            "commercial_eligibility": "editorial_only",
+            "editorial_caption_en": (
+                "Invented Place, USA - 27 June 2026: A road crosses a plain."
+            ),
+            "editorial_date": "2026-06-27",
+            "editorial_date_source": "unknown",
+            "editorial_location_en": "Invented Place, USA",
+            "location_source": "unknown",
+            "location_confidence": "unknown",
+        }
+        mode, reason = _submission_mode(metadata)
+        self.assertIsNone(mode)
+        self.assertIn("date has no evidence source", reason)
+
+        metadata["editorial_date_source"] = "exif"
+        metadata["location_source"] = ""
+        mode, reason = _submission_mode(metadata)
+        self.assertIsNone(mode)
+        self.assertIn("location has no evidence source", reason)
+
+        metadata["location_source"] = "unverified_guess"
+        mode, reason = _submission_mode(metadata)
+        self.assertIsNone(mode)
+        self.assertIn("location has no evidence source", reason)
+
+    def test_shutterstock_asset_card_requires_one_exact_filename(self):
+        class ExactText:
+            def __init__(self, matched):
+                self.matched = matched
+
+            def count(self):
+                return int(self.matched)
+
+        class Card:
+            def __init__(self, filename):
+                self.filename = filename
+
+            def get_by_text(self, value, exact):
+                return ExactText(exact and value == self.filename)
+
+            def inner_text(self):
+                return self.filename
+
+        class Cards:
+            def __init__(self, filenames):
+                self.cards = [Card(filename) for filename in filenames]
+
+            def count(self):
+                return len(self.cards)
+
+            def nth(self, index):
+                return self.cards[index]
+
+        class Page:
+            def __init__(self, filenames):
+                self.cards = Cards(filenames)
+
+            def locator(self, selector):
+                self.assert_selector = selector
+                return self.cards
+
+        exact = _find_asset_card(
+            Page(["DSC0145.jpg backup", "DSC0145.jpg"]),
+            "DSC0145.jpg",
+        )
+        self.assertEqual(exact.inner_text(), "DSC0145.jpg")
+        with self.assertRaisesRegex(RuntimeError, "multiple Shutterstock cards"):
+            _find_asset_card(
+                Page(["DSC0145.jpg", "DSC0145.jpg"]),
+                "DSC0145.jpg",
+            )
+
+    def test_shutterstock_keyword_replacement_verifies_ordered_values(self):
+        class Collection:
+            @property
+            def first(self):
+                return self
+
+            @property
+            def last(self):
+                return self
+
+            def __init__(self, page, kind):
+                self.page = page
+                self.kind = kind
+
+            def count(self):
+                if self.kind == "chips":
+                    return len(self.page.keywords)
+                return 1
+
+            def nth(self, index):
+                return Value(self.page.keywords[index])
+
+            def inner_text(self):
+                if self.kind == "form":
+                    return f"{len(self.page.keywords)}/50 Keywords"
+                return ""
+
+            def is_visible(self):
+                return True
+
+            def click(self, *args, **kwargs):
+                if self.kind == "erase":
+                    self.page.keywords = []
+
+            def fill(self, value):
+                self.page.pending = value
+
+            def press(self, key):
+                if self.kind == "input" and key == "Enter":
+                    self.page.keywords = [
+                        value.strip()
+                        for value in self.page.pending.split(",")
+                        if value.strip()
+                    ]
+
+        class Value:
+            def __init__(self, value):
+                self.value = value
+
+            def inner_text(self):
+                return self.value
+
+        class Page:
+            keyboard = Collection
+
+            def __init__(self):
+                self.keywords = ["old one", "old two"]
+                self.pending = ""
+                self.keyboard = Collection(self, "keyboard")
+
+            def locator(self, selector):
+                if selector == "form":
+                    return Collection(self, "form")
+                if selector.startswith("form [data-testid^="):
+                    return Collection(self, "chips")
+                if "More keyword actions" in selector:
+                    return Collection(self, "actions")
+                return Collection(self, "input")
+
+            def get_by_text(self, pattern):
+                return Collection(self, "erase")
+
+            def wait_for_timeout(self, timeout):
+                return None
+
+        page = Page()
+        _replace_keywords(page, ["new one", "new two", "new three"])
+        self.assertEqual(page.keywords, ["new one", "new two", "new three"])
+
+    def test_shutterstock_keyword_replacement_rejects_stale_equal_count(self):
+        class Locator:
+            @property
+            def first(self):
+                return self
+
+            @property
+            def last(self):
+                return self
+
+            def __init__(self, kind):
+                self.kind = kind
+
+            def count(self):
+                return 0 if self.kind == "chips" else 1
+
+            def inner_text(self):
+                return "7/50 Keywords" if self.kind == "form" else ""
+
+            def is_visible(self):
+                return True
+
+            def click(self, *args, **kwargs):
+                return None
+
+            def fill(self, value):
+                return None
+
+            def press(self, key):
+                return None
+
+        class Page:
+            keyboard = Locator("keyboard")
+
+            def locator(self, selector):
+                if selector == "form":
+                    return Locator("form")
+                if selector.startswith("form [data-testid^="):
+                    return Locator("chips")
+                return Locator("control")
+
+            def get_by_text(self, pattern):
+                return Locator("erase")
+
+            def wait_for_timeout(self, timeout):
+                return None
+
+        with self.assertRaisesRegex(RuntimeError, "ordered values"):
+            _replace_keywords(
+                Page(),
+                ["new1", "new2", "new3", "new4", "new5", "new6", "new7"],
+            )
 
     def test_shutterstock_commercial_mode_preserves_release_preflight(self):
         metadata = {

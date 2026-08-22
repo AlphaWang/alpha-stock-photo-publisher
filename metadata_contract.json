@@ -21,6 +21,7 @@
     "commercial_uses_en",
     "editorial_caption_en",
     "editorial_date",
+    "editorial_date_source",
     "editorial_location_en",
     "model_release_status",
     "property_release_status",
@@ -141,6 +142,9 @@
     "editorial_date": {
       "type": "string",
       "pattern": "^$|^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "editorial_date_source": {
+      "enum": ["unknown", "context", "exif", "manual"]
     },
     "editorial_location_en": {"type": "string", "maxLength": 120},
     "model_release_status": {

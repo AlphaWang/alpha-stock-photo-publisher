@@ -99,6 +99,7 @@ Read the reported `preview_manifest.json` and inspect the overview plus all four
       "commercial_uses_en": ["..."],
       "editorial_caption_en": "",
       "editorial_date": "",
+      "editorial_date_source": "unknown",
       "editorial_location_en": "",
       "model_release_status": "not_required",
       "property_release_status": "unknown",
@@ -180,7 +181,7 @@ PYTHONUNBUFFERED=1 python3 upload_photos.py <path> --platform <platform> [--dry-
 ```
 
 Relay meaningful progress, remain attached until the command exits, and report the final `Upload summary`, including `[warn]`, `[review]`, and failed items. A successful browser upload can still require contributor review for releases, logos, private property, or editorial-only content.
-Upload preflight requires SHA-bound, visually verified, current-quality metadata and rejects repeated batch copy by default. Automatic commercial metadata entry stops for unresolved model/property releases, logos, copyrighted content, or editorial-only assets. Shutterstock editorial submission is allowed only when `commercial_eligibility` is `editorial_only` and all three evidenced fields are complete: `editorial_caption_en`, `editorial_date`, and `editorial_location_en`. Treat `--allow-unreviewed-metadata` and `--allow-repeated-metadata` as exceptional manual overrides; never add them silently.
+Upload preflight requires SHA-bound, visually verified, current-quality metadata and rejects repeated batch copy by default. Automatic commercial metadata entry stops for unresolved model/property releases, logos, copyrighted content, or editorial-only assets. Shutterstock editorial submission is allowed only when `commercial_eligibility` is `editorial_only`, `editorial_caption_en`, `editorial_date`, and `editorial_location_en` are complete, `editorial_date_source` is `exif`, `context`, or `manual`, and the shared location source/confidence is known with at least medium confidence. Treat `--allow-unreviewed-metadata` and `--allow-repeated-metadata` as exceptional manual overrides; never add them silently.
 
 On first use, a browser may open for login and wait for Enter in the terminal. Sessions are stored under `.session/`.
 
@@ -192,7 +193,7 @@ For each `Eligible for Editorial Use` return:
 
 1. Reinspect the overview and all detail crops. Correct visual facts, descriptions, and keywords before changing usage. Pay special attention to distant people, boats, vehicles, license plates, signs, stickers, logos, artwork, and managed attractions. Remove `no people` whenever any person is visible, even when distant or unrecognizable.
 2. Set release/IP fields from the evidence and set `commercial_eligibility` to `editorial_only`. Do not convert a platform return back to commercial unless releases or cleaned source artwork genuinely resolve the stated issue.
-3. Populate `editorial_date` only from EXIF, supplied shooting context, or manual confirmation. Populate `editorial_location_en` at the most specific reliable geographic level. Write `editorial_caption_en` as `LOCATION - D Month YYYY: factual visible description`; do not guess a venue, event, brand, or exact sublocation.
+3. Populate `editorial_date` only from EXIF, supplied shooting context, or manual confirmation and record that evidence as `editorial_date_source`. Populate `editorial_location_en` at the most specific reliable geographic level and set the shared `location_source` plus `location_confidence`; automatic repair requires medium or high confidence. Write `editorial_caption_en` as `LOCATION - D Month YYYY: factual visible description`; do not guess a venue, event, brand, or exact sublocation.
 4. Regenerate the review pack, complete an independent review, issue a new receipt, and write a new timestamped JSON. The corrected record must remain SHA-bound to the original image.
 5. After the user explicitly asks to apply the repair, run:
 

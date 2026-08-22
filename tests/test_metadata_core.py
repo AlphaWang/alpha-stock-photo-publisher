@@ -204,6 +204,10 @@ class MetadataCoreTests(unittest.TestCase):
 
         self.assertIn("editorial-only metadata requires editorial_caption_en", errors)
         self.assertIn("editorial-only metadata requires editorial_date", errors)
+        self.assertIn(
+            "editorial-only metadata requires a known editorial_date_source",
+            errors,
+        )
         self.assertIn("editorial-only metadata requires editorial_location_en", errors)
 
     def test_valid_editorial_caption_uses_evidenced_date_and_location(self):
@@ -217,7 +221,10 @@ class MetadataCoreTests(unittest.TestCase):
                 "copyrighted_content_status": "none",
                 "release_notes": "Visible sign requires editorial use.",
                 "editorial_date": "2026-06-26",
+                "editorial_date_source": "exif",
                 "editorial_location_en": "Bonneville Salt Flats, Utah, USA",
+                "location_source": "context",
+                "location_confidence": "high",
                 "editorial_caption_en": (
                     "Bonneville Salt Flats, Utah, USA - 26 June 2026: "
                     "A weathered entrance sign covered with stickers stands by the salt plain."
@@ -238,7 +245,10 @@ class MetadataCoreTests(unittest.TestCase):
                 "copyrighted_content_status": "none",
                 "release_notes": "Visible sign requires editorial use.",
                 "editorial_date": "2026-06-26",
+                "editorial_date_source": "context",
                 "editorial_location_en": "Bonneville Salt Flats, Utah, USA",
+                "location_source": "context",
+                "location_confidence": "high",
                 "editorial_caption_en": (
                     "Salt Lake City, Utah, USA - 25 June 2026: A sign beside a road."
                 ),
@@ -248,6 +258,32 @@ class MetadataCoreTests(unittest.TestCase):
         errors = validate_metadata_quality(enforce_limits(metadata))
         self.assertTrue(any("must start" in error for error in errors), errors)
         self.assertTrue(any("must contain the editorial date" in error for error in errors), errors)
+
+    def test_editorial_metadata_requires_date_and_location_provenance(self):
+        metadata = sample_metadata()
+        metadata.update(
+            {
+                "commercial_eligibility": "editorial_only",
+                "model_release_status": "not_required",
+                "property_release_status": "not_required",
+                "logo_trademark_status": "visible",
+                "copyrighted_content_status": "none",
+                "release_notes": "Visible sign requires editorial use.",
+                "editorial_date": "2026-06-26",
+                "editorial_date_source": "unknown",
+                "editorial_location_en": "Invented Place, USA",
+                "location_source": "unknown",
+                "location_confidence": "unknown",
+                "editorial_caption_en": (
+                    "Invented Place, USA - 26 June 2026: A sign beside a road."
+                ),
+            }
+        )
+
+        errors = validate_metadata_quality(enforce_limits(metadata))
+        self.assertTrue(any("editorial_date_source" in error for error in errors))
+        self.assertTrue(any("known location_source" in error for error in errors))
+        self.assertTrue(any("location_confidence" in error for error in errors))
 
     def test_batch_quality_detects_repeated_metadata(self):
         first = enforce_limits(sample_metadata())

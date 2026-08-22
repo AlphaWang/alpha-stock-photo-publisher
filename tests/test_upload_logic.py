@@ -39,7 +39,11 @@ from upload.confirmation import wait_for_success_text
 from upload.shutterstock import (
     _asset_card_is_ready,
     _canonical_category,
+    _correction_is_editorial_eligible,
+    _correction_was_resubmitted,
     _keyword_count_from_text,
+    _set_usage,
+    _submission_mode,
     _validation_payload_is_ready,
     _has_logged_in_session as shutterstock_session_ready,
 )
@@ -173,6 +177,93 @@ class UploadLogicTests(unittest.TestCase):
                 {"mediaStatus": [{"id": "1", "status": "needs_attention"}]}
             )
         )
+
+    def test_shutterstock_correction_requires_editorial_eligibility_reason(self):
+        self.assertTrue(
+            _correction_is_editorial_eligible(
+                "Correction needed (1) Eligible for Editorial Use"
+            )
+        )
+        self.assertFalse(
+            _correction_is_editorial_eligible("Correction needed: add a release")
+        )
+
+    def test_shutterstock_correction_requires_resubmitted_card_status(self):
+        self.assertTrue(
+            _correction_was_resubmitted(
+                "DSC02975.jpg Editorial Resubmitted View corrections"
+            )
+        )
+        self.assertTrue(_correction_was_resubmitted("DSC02975.jpg 已重新提交"))
+        self.assertFalse(
+            _correction_was_resubmitted(
+                "DSC02975.jpg Editorial Correction needed Make changes"
+            )
+        )
+
+    def test_shutterstock_usage_selects_explicit_editorial_button(self):
+        class UsageControl:
+            pressed = False
+
+            @property
+            def last(self):
+                return self
+
+            def count(self):
+                return 1
+
+            def get_attribute(self, name):
+                return "true" if self.pressed else "false"
+
+            def click(self, timeout):
+                self.pressed = True
+
+        class Page:
+            def __init__(self):
+                self.selector = ""
+                self.control = UsageControl()
+
+            def locator(self, selector):
+                self.selector = selector
+                return self.control
+
+            def wait_for_timeout(self, timeout):
+                return None
+
+        page = Page()
+        self.assertTrue(_set_usage(page, "editorial"))
+        self.assertEqual(page.selector, "form [data-testid='button-editorial']")
+
+    def test_shutterstock_editorial_mode_requires_complete_caption_fields(self):
+        metadata = {
+            "commercial_eligibility": "editorial_only",
+            "editorial_caption_en": "",
+            "editorial_date": "2026-06-27",
+            "editorial_location_en": "Grand Teton National Park, Wyoming, USA",
+        }
+        mode, reason = _submission_mode(metadata)
+        self.assertIsNone(mode)
+        self.assertIn("editorial_caption_en", reason)
+
+        metadata["editorial_caption_en"] = (
+            "Grand Teton National Park, Wyoming, USA - 27 June 2026: "
+            "Kayakers cross a mountain lake below the Teton Range."
+        )
+        self.assertEqual(_submission_mode(metadata), ("editorial", ""))
+
+    def test_shutterstock_commercial_mode_preserves_release_preflight(self):
+        metadata = {
+            "model_release_status": "not_required",
+            "property_release_status": "not_required",
+            "logo_trademark_status": "none",
+            "copyrighted_content_status": "none",
+            "commercial_eligibility": "clear",
+        }
+        self.assertEqual(_submission_mode(metadata), ("commercial", ""))
+        metadata["logo_trademark_status"] = "visible"
+        mode, reason = _submission_mode(metadata)
+        self.assertIsNone(mode)
+        self.assertIn("logo/trademark", reason)
 
     def test_adobe_original_filename_ignores_footer_actions(self):
         footer = (

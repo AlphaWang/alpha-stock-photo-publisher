@@ -69,6 +69,9 @@ METADATA_FIELDS = (
     "location_confidence",
     "core_keywords_zh",
     "commercial_uses_en",
+    "editorial_caption_en",
+    "editorial_date",
+    "editorial_location_en",
     "model_release_status",
     "property_release_status",
     "logo_trademark_status",
@@ -91,6 +94,8 @@ Optimize for commercial usefulness:
 - Prefer specific terms over filler. Avoid keyword stuffing, repeated word stems, near-duplicates, camera/gear terms, file info, links, emojis, and unrelated trends.
 - Avoid trademarks, brand/product names, artist names, fictional characters, and private personal information for commercial submissions.
 - Put visible logos, recognizable private property, or recognizable people that may need review only in release_notes, never in keywords.
+- When commercial_eligibility is editorial_only, prepare an objective Shutterstock editorial caption. Use only a capture date and geographic location supported by EXIF, supplied context, or manual confirmation; never guess either value.
+- Format editorial_caption_en as "LOCATION - D Month YYYY: factual visible description". Mention visible signs, brands, vehicles, or incidental people only when factually relevant, without promotional language.
 - Use neutral, respectful language. Do not infer sensitive identity traits unless clearly visible or supplied by context.
 - Keep descriptions factual and image-specific. Do not pad them with generic phrases such as "Presented as" or rotate adjectives to simulate variation.
 
@@ -138,6 +143,9 @@ Return strict JSON with no markdown fences and exactly these fields. Use an empt
   "location_confidence": "unknown, low, medium, or high",
   "core_keywords_zh": ["up to five objective terms from keywords_zh"],
   "commercial_uses_en": ["up to five realistic buyer use cases"],
+  "editorial_caption_en": "LOCATION - D Month YYYY: factual visible description, or empty string",
+  "editorial_date": "YYYY-MM-DD supported by evidence, or empty string",
+  "editorial_location_en": "Geographic location used in the editorial caption, or empty string",
   "model_release_status": "not_required, required, provided, or unknown",
   "property_release_status": "not_required, required, provided, or unknown",
   "logo_trademark_status": "none, visible, or unknown",
@@ -392,6 +400,13 @@ def enforce_limits(result: dict) -> dict:
     normalized["commercial_uses_en"] = normalize_keywords(
         normalized.get("commercial_uses_en", []), limit=0
     )
+    normalized["editorial_caption_en"] = clean_text(
+        normalized.get("editorial_caption_en", "")
+    )
+    normalized["editorial_date"] = clean_text(normalized.get("editorial_date", ""))
+    normalized["editorial_location_en"] = clean_text(
+        normalized.get("editorial_location_en", "")
+    )
 
     structured_release_fields = (
         "model_release_status",
@@ -527,6 +542,8 @@ def validate_metadata(result: dict) -> list[str]:
         ("description_zh", PX500_DESC_MAX),
         ("location_en", 80),
         ("location_zh", 80),
+        ("editorial_caption_en", SHUTTERSTOCK_DESC_MAX),
+        ("editorial_location_en", 120),
         ("release_notes", 240),
     ):
         if len(result.get(field, "")) > limit:
@@ -543,6 +560,12 @@ def validate_metadata(result: dict) -> list[str]:
         errors.append("core_keywords_zh exceeds 5 keywords")
     if len(result.get("commercial_uses_en", [])) > 5:
         errors.append("commercial_uses_en exceeds 5 values")
+    editorial_date = result.get("editorial_date", "")
+    if editorial_date:
+        try:
+            datetime.strptime(editorial_date, "%Y-%m-%d")
+        except ValueError:
+            errors.append("editorial_date must use YYYY-MM-DD")
     if result.get("category1") not in SHUTTERSTOCK_CATEGORIES:
         errors.append("category1 is invalid")
     if result.get("category2") and result.get("category2") not in SHUTTERSTOCK_CATEGORIES:
@@ -628,6 +651,34 @@ def validate_metadata_quality(result: dict) -> list[str]:
             )
     elif not release_notes:
         errors.append("commercial review or editorial-only metadata requires release_notes")
+
+    if result.get("commercial_eligibility") == "editorial_only":
+        caption = clean_text(result.get("editorial_caption_en", ""))
+        date_value = clean_text(result.get("editorial_date", ""))
+        location = clean_text(result.get("editorial_location_en", ""))
+        if not caption:
+            errors.append("editorial-only metadata requires editorial_caption_en")
+        if not date_value:
+            errors.append("editorial-only metadata requires editorial_date")
+        if not location:
+            errors.append("editorial-only metadata requires editorial_location_en")
+        if caption and location and not caption.casefold().startswith(
+            location.casefold() + " - "
+        ):
+            errors.append(
+                "editorial_caption_en must start with editorial_location_en followed by ' - '"
+            )
+        if caption and date_value:
+            try:
+                display_date = datetime.strptime(date_value, "%Y-%m-%d").strftime(
+                    "%d %B %Y"
+                ).lstrip("0")
+            except ValueError:
+                display_date = ""
+            if display_date and display_date.casefold() not in caption.casefold():
+                errors.append(
+                    "editorial_caption_en must contain the editorial date as D Month YYYY"
+                )
     return errors
 
 

@@ -13,11 +13,16 @@ Confirmed UI flow (from browser inspection sessions):
   8. Fill description_en and keywords_en
   9. Fill Category 1 and Category 2 via MUI Select (data-testid scoped)
   10. Click Save button (data-testid='edit-dialog-save-button')
+  11. For returned assets, switch to Editorial and click Submit; require the
+      asset card to show Resubmitted before recording success
 """
+
+from __future__ import annotations
 
 from pathlib import Path
 import json
 import re
+from urllib.parse import urlparse
 
 from playwright.sync_api import BrowserContext, TimeoutError as PWTimeout
 
@@ -27,6 +32,7 @@ from .status import UploadStatus
 from metadata_core import commercial_submission_review_reason, platform_category
 
 PORTFOLIO_URL = "https://submit.shutterstock.com/portfolio/not_submitted/photo"
+CORRECTION_URL = "https://submit.shutterstock.com/portfolio/recently_reviewed/photo/returned"
 LOGIN_URL = "https://submit.shutterstock.com/"
 
 CATEGORY_LABELS_ZH = {
@@ -133,6 +139,41 @@ def _validation_payload_is_ready(payload: object) -> bool:
     )
 
 
+def _correction_is_editorial_eligible(text: str) -> bool:
+    normalized = " ".join(text.split()).casefold()
+    return (
+        "correction needed" in normalized
+        and "eligible for editorial use" in normalized
+    )
+
+
+def _correction_was_resubmitted(text: str) -> bool:
+    normalized = " ".join(text.split()).casefold()
+    return "resubmitted" in normalized or "已重新提交" in normalized
+
+
+def _submission_mode(meta: dict) -> tuple[str | None, str]:
+    eligibility = str(meta.get("commercial_eligibility", "review")).strip().lower()
+    if eligibility == "editorial_only":
+        missing = [
+            field
+            for field in (
+                "editorial_caption_en",
+                "editorial_date",
+                "editorial_location_en",
+            )
+            if not str(meta.get(field, "")).strip()
+        ]
+        if missing:
+            return None, "editorial metadata is missing: " + ", ".join(missing)
+        return "editorial", ""
+
+    reason = commercial_submission_review_reason(meta)
+    if reason:
+        return None, reason
+    return "commercial", ""
+
+
 def _ensure_english_metadata_language(page) -> None:
     control = page.locator("[aria-label='select_language']").first
     if "English" in control.inner_text():
@@ -200,11 +241,72 @@ def _set_categories(page, category1: str, category2: str) -> bool:
     return True
 
 
-def _fill_metadata(page, img: Path, meta: dict) -> bool:
+def _set_usage(page, usage: str) -> bool:
+    test_id = "button-editorial" if usage == "editorial" else "button-commercial"
+    control = page.locator(f"form [data-testid='{test_id}']").last
+    if control.count() == 0:
+        print("  [review] Shutterstock usage control was not found", flush=True)
+        return False
+    if control.get_attribute("aria-pressed") == "true":
+        return True
+
+    control.click(timeout=5_000)
+    page.wait_for_timeout(250)
+    return control.get_attribute("aria-pressed") == "true"
+
+
+def _replace_keywords(page, keywords: list[str]) -> None:
+    keyword_count = _keyword_count_from_text(page.locator("form").inner_text())
+    if keyword_count:
+        actions = page.locator("button[aria-label='More keyword actions']").last
+        erased = False
+        if actions.count() > 0:
+            actions.click(timeout=5_000)
+            erase = page.get_by_text(
+                re.compile(
+                    r"^(Erase all keywords|Clear all keywords|清除所有关键词)$",
+                    re.I,
+                )
+            ).last
+            if erase.count() > 0 and erase.is_visible():
+                erase.click(timeout=5_000)
+                erased = True
+            else:
+                page.keyboard.press("Escape")
+        if not erased:
+            chips = page.locator("form [data-testid^='selected-keyword-']")
+            for _ in range(50):
+                if chips.count() == 0:
+                    erased = True
+                    break
+                before = chips.count()
+                chips.first.press("Delete")
+                if chips.count() >= before:
+                    break
+        if not erased:
+            raise RuntimeError("existing Shutterstock keywords could not be cleared")
+        # The keyword input is briefly replaced after the final chip disappears.
+        page.wait_for_timeout(250)
+
+    kw_input = page.locator(
+        "input[placeholder*='Add keyword'], input[placeholder*='添加关键词']"
+    ).first
+    kw_input.click()
+    kw_input.fill(", ".join(keywords))
+    kw_input.press("Enter")
+    expected = len({str(keyword).strip().casefold() for keyword in keywords if keyword})
+    actual = _keyword_count_from_text(page.locator("form").inner_text())
+    if actual != expected:
+        raise RuntimeError(
+            f"Shutterstock keyword replacement produced {actual}, expected {expected}"
+        )
+
+
+def _fill_metadata(page, img: Path, meta: dict, *, correction: bool = False) -> bool:
     """Fill description, keywords, and categories for the currently open edit panel."""
-    commercial_reason = commercial_submission_review_reason(meta)
-    if commercial_reason:
-        print(f"  [review] {img.name}: {commercial_reason}")
+    usage, review_reason = _submission_mode(meta)
+    if review_reason:
+        print(f"  [review] {img.name}: {review_reason}")
         return False
     # Wait for the panel to show THIS image's title before filling anything.
     # Without this, a React re-render caused by the card transition can clear
@@ -214,7 +316,11 @@ def _fill_metadata(page, img: Path, meta: dict) -> bool:
     page.wait_for_timeout(400)  # let React finish rendering the freshly opened panel
     _ensure_english_metadata_language(page)
 
-    desc_text = meta.get("description_en", "")
+    desc_text = (
+        meta.get("editorial_caption_en", "")
+        if usage == "editorial"
+        else meta.get("description_en", "")
+    )
     desc_area = page.locator("textarea[name='description']")
     desc_area.click()
     desc_area.fill(desc_text)
@@ -233,12 +339,11 @@ def _fill_metadata(page, img: Path, meta: dict) -> bool:
             desc_text,
         )
 
-    kw_input = page.locator(
-        "input[placeholder*='Add keyword'], input[placeholder*='添加关键词']"
-    ).first
-    kw_input.click()
-    kw_input.fill(", ".join(meta.get("keywords_en", [])))
-    kw_input.press("Enter")
+    _replace_keywords(page, meta.get("keywords_en", []))
+
+    if not _set_usage(page, usage):
+        print(f"  [review] {img.name}: Shutterstock usage was not set to {usage}")
+        return False
 
     platform_categories = platform_category(meta, "shutterstock")
     if isinstance(platform_categories, list) and platform_categories:
@@ -249,13 +354,16 @@ def _fill_metadata(page, img: Path, meta: dict) -> bool:
     if not _set_categories(page, cat1, cat2):
         return False
 
-    save_button = page.locator("[data-testid='edit-dialog-save-button']")
+    action_test_id = (
+        "edit-dialog-submit-button" if correction else "edit-dialog-save-button"
+    )
+    save_button = page.locator(f"[data-testid='{action_test_id}']")
     save_response = None
     try:
         with page.expect_response(
             lambda response: (
                 response.request.method == "POST"
-                and response.url.endswith("/api/next/media/validate")
+                and urlparse(response.url).path.endswith("/api/next/media/validate")
             ),
             timeout=3_000,
         ) as response_info:
@@ -263,12 +371,33 @@ def _fill_metadata(page, img: Path, meta: dict) -> bool:
         save_response = response_info.value
     except PWTimeout:
         pass
-    if save_response is not None and save_response.ok:
+    if save_response is not None:
+        if not save_response.ok:
+            return False
         try:
-            if _validation_payload_is_ready(save_response.json()):
-                return True
+            response_ready = _validation_payload_is_ready(save_response.json())
         except Exception:
-            pass
+            return False
+        if not response_ready:
+            return False
+
+    if correction:
+        # A successful correction may not emit the normal validation response.
+        # The returned-asset card is authoritative and changes to Resubmitted.
+        try:
+            page.wait_for_function(
+                """filename => Array.from(document.querySelectorAll('.MuiCard-root'))
+                    .some(card => card.innerText.includes(filename)
+                        && /resubmitted|已重新提交/i.test(card.innerText))""",
+                img.name,
+                timeout=10_000,
+            )
+        except PWTimeout:
+            return False
+        return _correction_was_resubmitted(_find_asset_card(page, img.name).inner_text())
+
+    if save_response is not None:
+        return True
 
     filename = json.dumps(img.name, ensure_ascii=False)
     page.wait_for_timeout(1_200)
@@ -410,6 +539,74 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
 
     except Exception as e:
         print(f"  ✗ Shutterstock batch upload failed — {e}")
+        return {img.name: UploadStatus.FAILED for img, _ in pairs}
+    finally:
+        page.close()
+
+
+def repair_corrections_batch(
+    pairs: list[tuple[Path, dict]], context: BrowserContext
+) -> dict[str, UploadStatus]:
+    """Repair editorial-eligible Shutterstock returns without re-uploading files."""
+    page = context.new_page()
+    try:
+        ensure_logged_in(
+            page,
+            lambda: _is_logged_in(page),
+            LOGIN_URL,
+            poll_logged_in=lambda: _has_logged_in_session(page),
+        )
+        page.goto(CORRECTION_URL, wait_until="domcontentloaded", timeout=30_000)
+        _dismiss_cookie_consent(page)
+        results: dict[str, UploadStatus] = {}
+        for img, meta in pairs:
+            try:
+                card = _find_asset_card(page, img.name)
+                if card.count() == 0:
+                    print(
+                        f"  [review] Shutterstock correction not found: {img.name}",
+                        flush=True,
+                    )
+                    results[img.name] = UploadStatus.NEEDS_REVIEW
+                    continue
+                card_text = card.inner_text()
+                if _correction_was_resubmitted(card_text):
+                    print(
+                        f"  ✓ Shutterstock correction already submitted: {img.name}",
+                        flush=True,
+                    )
+                    results[img.name] = UploadStatus.SUBMITTED
+                    continue
+                if not _correction_is_editorial_eligible(card_text):
+                    print(
+                        f"  [review] Unsupported Shutterstock correction: {img.name}",
+                        flush=True,
+                    )
+                    results[img.name] = UploadStatus.NEEDS_REVIEW
+                    continue
+                mode, reason = _submission_mode(meta)
+                if mode != "editorial":
+                    print(
+                        f"  [review] {img.name}: {reason or 'editorial metadata is required'}",
+                        flush=True,
+                    )
+                    results[img.name] = UploadStatus.NEEDS_REVIEW
+                    continue
+
+                card.locator("button:has-text('Make changes')").click(timeout=5_000)
+                if not _fill_metadata(page, img, meta, correction=True):
+                    raise RuntimeError("editorial correction save was not confirmed")
+                print(f"  ✓ Shutterstock correction submitted: {img.name}", flush=True)
+                results[img.name] = UploadStatus.SUBMITTED
+                page.wait_for_timeout(500)
+            except Exception as error:
+                print(f"  ✗ Shutterstock correction: {img.name} — {error}", flush=True)
+                results[img.name] = UploadStatus.FAILED
+                if not page.is_closed():
+                    page.keyboard.press("Escape")
+        return results
+    except Exception as error:
+        print(f"  ✗ Shutterstock correction repair failed — {error}", flush=True)
         return {img.name: UploadStatus.FAILED for img, _ in pairs}
     finally:
         page.close()

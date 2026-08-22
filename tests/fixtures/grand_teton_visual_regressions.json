@@ -105,5 +105,27 @@
       "keywords_zh": ["山峰", "倒影", "水面"]
     },
     "expected_issue": "reflection_visible=no"
+  },
+  {
+    "name": "viewpoint photo frame must not become Snake River",
+    "facts_patch": {
+      "primary_subjects_en": ["decorative photo frame"],
+      "primary_subjects_zh": ["装饰取景框"],
+      "text_visible": "yes",
+      "copyrighted_content_visible": "unknown",
+      "required_terms_en": ["decorative photo frame"],
+      "required_terms_zh": ["装饰取景框"],
+      "forbidden_claims_en": ["snake river"],
+      "forbidden_claims_zh": ["蛇河"]
+    },
+    "metadata_patch": {
+      "title_en": "Snake River below the Teton Range",
+      "description_en": "The Snake River winds below the Teton Range.",
+      "keywords_en": ["snake river", "teton range", "landscape"],
+      "title_zh": "大提顿山脉下的蛇河",
+      "description_zh": "蛇河蜿蜒流过大提顿山脉下方。",
+      "keywords_zh": ["蛇河", "大提顿山脉", "风景"]
+    },
+    "expected_issue": "visually unsupported en claim: snake river"
   }
 ]

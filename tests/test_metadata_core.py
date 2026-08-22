@@ -187,6 +187,68 @@ class MetadataCoreTests(unittest.TestCase):
         self.assertEqual(normalized["release_status"], "required")
         self.assertIn("logo/trademark", commercial_submission_review_reason(normalized))
 
+    def test_editorial_only_metadata_requires_shutterstock_caption_components(self):
+        metadata = sample_metadata()
+        metadata.update(
+            {
+                "commercial_eligibility": "editorial_only",
+                "model_release_status": "not_required",
+                "property_release_status": "not_required",
+                "logo_trademark_status": "visible",
+                "copyrighted_content_status": "none",
+                "release_notes": "Visible sign requires editorial use.",
+            }
+        )
+
+        errors = validate_metadata_quality(enforce_limits(metadata))
+
+        self.assertIn("editorial-only metadata requires editorial_caption_en", errors)
+        self.assertIn("editorial-only metadata requires editorial_date", errors)
+        self.assertIn("editorial-only metadata requires editorial_location_en", errors)
+
+    def test_valid_editorial_caption_uses_evidenced_date_and_location(self):
+        metadata = sample_metadata()
+        metadata.update(
+            {
+                "commercial_eligibility": "editorial_only",
+                "model_release_status": "not_required",
+                "property_release_status": "not_required",
+                "logo_trademark_status": "visible",
+                "copyrighted_content_status": "none",
+                "release_notes": "Visible sign requires editorial use.",
+                "editorial_date": "2026-06-26",
+                "editorial_location_en": "Bonneville Salt Flats, Utah, USA",
+                "editorial_caption_en": (
+                    "Bonneville Salt Flats, Utah, USA - 26 June 2026: "
+                    "A weathered entrance sign covered with stickers stands by the salt plain."
+                ),
+            }
+        )
+
+        self.assertEqual(validate_metadata_quality(enforce_limits(metadata)), [])
+
+    def test_editorial_caption_must_match_structured_date_and_location(self):
+        metadata = sample_metadata()
+        metadata.update(
+            {
+                "commercial_eligibility": "editorial_only",
+                "model_release_status": "not_required",
+                "property_release_status": "not_required",
+                "logo_trademark_status": "visible",
+                "copyrighted_content_status": "none",
+                "release_notes": "Visible sign requires editorial use.",
+                "editorial_date": "2026-06-26",
+                "editorial_location_en": "Bonneville Salt Flats, Utah, USA",
+                "editorial_caption_en": (
+                    "Salt Lake City, Utah, USA - 25 June 2026: A sign beside a road."
+                ),
+            }
+        )
+
+        errors = validate_metadata_quality(enforce_limits(metadata))
+        self.assertTrue(any("must start" in error for error in errors), errors)
+        self.assertTrue(any("must contain the editorial date" in error for error in errors), errors)
+
     def test_batch_quality_detects_repeated_metadata(self):
         first = enforce_limits(sample_metadata())
         second = enforce_limits(sample_metadata())

@@ -77,6 +77,7 @@ Both agent skills follow the same workflow:
 3. Build immutable one-image review sheets and record independent per-image decisions
 4. Issue a v3 audit receipt, then write SHA-bound, fact-bound metadata
 5. Curate near-identical bursts and upload only when explicitly requested
+6. Repair platform returns with evidence-bound Editorial metadata when supported
 
 Existing JSON is reused only when it is SHA-bound, visually verified, and passes
 the current quality checks. Merely having a JSON file no longer counts as a
@@ -180,6 +181,7 @@ rate, so prompt or model changes can be measured on real labeled photos.
 ```bash
 python3 upload_photos.py /path/to/dir --platform shutterstock
 python3 upload_photos.py /path/to/dir --platform shutterstock --force
+python3 upload_photos.py /path/to/dir --platform shutterstock --repair-corrections
 ```
 
 `--platform all` runs the stable platforms. Getty/iStock remains experimental and
@@ -197,6 +199,31 @@ Unreviewed metadata, factual/ordering/spam defects, commercial release risks, an
 repeated batch copy are blocked by default. Keyword-count advisories do not block
 upload. `--allow-unreviewed-metadata` and `--allow-repeated-metadata` are explicit
 manual overrides and should not be used by the normal skill workflow.
+
+### Repair Shutterstock corrections
+
+`--repair-corrections` handles existing Shutterstock items marked `Correction
+needed` without uploading the image again. It matches the exact filename on the
+returned-items page and only automates the platform's `Eligible for Editorial
+Use` correction. Other review reasons remain manual review items.
+
+Editorial repair metadata must be SHA-bound and visually verified, with
+`commercial_eligibility: "editorial_only"` and three evidence-backed fields:
+
+```json
+{
+  "editorial_date": "2026-06-27",
+  "editorial_location_en": "Grand Teton National Park, Wyoming, USA",
+  "editorial_caption_en": "Grand Teton National Park, Wyoming, USA - 27 June 2026: Kayakers cross a mountain lake below the Teton Range."
+}
+```
+
+The repair workflow replaces stale keywords rather than appending to them,
+switches Shutterstock Usage to Editorial, uses the correction-specific Submit
+action, and records a submitted status only after the exact card shows
+`Resubmitted`. It refuses missing cards,
+unsupported correction reasons, uncertain dates or locations, incomplete
+Editorial fields, and unresolved visual-review failures.
 
 ## First run (browser login)
 
@@ -267,6 +294,9 @@ Each image produces a timestamped JSON file alongside it, e.g. `DSC00012.jpg_202
   "location_confidence": "unknown",
   "core_keywords_zh": ["..."],
   "commercial_uses_en": ["travel marketing"],
+  "editorial_caption_en": "",
+  "editorial_date": "",
+  "editorial_location_en": "",
   "model_release_status": "not_required",
   "property_release_status": "unknown",
   "logo_trademark_status": "none",

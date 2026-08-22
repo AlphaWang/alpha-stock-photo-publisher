@@ -228,6 +228,7 @@ def run_upload(
     allow_unreviewed_metadata: bool = False,
     allow_quality_warnings: bool = False,
     allow_repeated_metadata: bool = False,
+    repair_corrections: bool = False,
 ) -> bool:
     from playwright.sync_api import sync_playwright
     import upload.px500 as _px500
@@ -247,7 +248,12 @@ def run_upload(
         preflight_results = {}
         for img, json_path in pairs:
             entry = completed.get(digests[img.name])
-            if not force and entry is not None and _history_entry_completed(entry):
+            if (
+                not repair_corrections
+                and not force
+                and entry is not None
+                and _history_entry_completed(entry)
+            ):
                 skipped += 1
                 continue
             try:
@@ -347,9 +353,10 @@ def run_upload(
 
     def execute_platform(key, loaded, context):
         if key == "shutterstock":
-            from upload.shutterstock import upload_batch
+            from upload.shutterstock import repair_corrections_batch, upload_batch
+            batch_fn = repair_corrections_batch if repair_corrections else upload_batch
             return _run_platform_batch(
-                loaded, lambda chunk: upload_batch(chunk, context),
+                loaded, lambda chunk: batch_fn(chunk, context),
                 _BATCH_LIMIT[key], key,
             )
         if key == "px500":
@@ -391,7 +398,8 @@ def run_upload(
             results_by_platform[_PLATFORM_LABELS[key]].update(batch_results)
             record(key, batch_results)
 
-    print("\nUpload summary:", flush=True)
+    summary_label = "Correction repair summary" if repair_corrections else "Upload summary"
+    print(f"\n{summary_label}:", flush=True)
     platform_keys = {label: key for key, label in _PLATFORM_LABELS.items()}
     for label, batch_results in results_by_platform.items():
         counts = {
@@ -450,7 +458,18 @@ def main() -> int:
         action="store_true",
         help="Allow repeated titles/descriptions after explicit review",
     )
+    parser.add_argument(
+        "--repair-corrections",
+        action="store_true",
+        help=(
+            "Repair matching Shutterstock Correction needed items using "
+            "editorial metadata without uploading the files again"
+        ),
+    )
     args = parser.parse_args()
+
+    if args.repair_corrections and args.platform != "shutterstock":
+        parser.error("--repair-corrections requires --platform shutterstock")
 
     target = Path(args.directory).expanduser().resolve()
 
@@ -484,6 +503,7 @@ def main() -> int:
         allow_unreviewed_metadata=args.allow_unreviewed_metadata,
         allow_quality_warnings=args.allow_quality_warnings,
         allow_repeated_metadata=args.allow_repeated_metadata,
+        repair_corrections=args.repair_corrections,
     ) else 1
 
 

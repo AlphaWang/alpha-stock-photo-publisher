@@ -70,6 +70,10 @@ CATEGORY_LABELS_ZH = {
 }
 
 
+class AmbiguousAssetCardError(RuntimeError):
+    """Raised when a filename cannot identify one Shutterstock asset safely."""
+
+
 def _has_logged_in_session(page) -> bool:
     url = page.url.lower()
     return (
@@ -111,9 +115,12 @@ def _dismiss_cookie_consent(page) -> None:
 def _card_has_exact_filename(card, image_name: str) -> bool:
     if card.get_by_text(image_name, exact=True).count() > 0:
         return True
-    return image_name in {
-        line.strip() for line in card.inner_text().splitlines() if line.strip()
-    }
+    asset_label = re.compile(rf"^\d+\s*-\s*{re.escape(image_name)}$")
+    for raw_line in card.inner_text().splitlines():
+        line = raw_line.strip()
+        if line == image_name or asset_label.fullmatch(line):
+            return True
+    return False
 
 
 def _find_asset_card(page, image_name: str):
@@ -125,7 +132,7 @@ def _find_asset_card(page, image_name: str):
         if _card_has_exact_filename(card, image_name):
             matches.append(card)
     if len(matches) > 1:
-        raise RuntimeError(
+        raise AmbiguousAssetCardError(
             f"multiple Shutterstock cards have the exact filename {image_name!r}"
         )
     return matches[0] if matches else None
@@ -546,8 +553,16 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
         pre_count = page.locator(".MuiCard-root").count()
         missing_pairs = []
         results: dict[str, UploadStatus] = {}
+        review_names: set[str] = set()
         for img, meta in pairs:
-            if _find_asset_card(page, img.name) is not None:
+            try:
+                card = _find_asset_card(page, img.name)
+            except AmbiguousAssetCardError as error:
+                print(f"  [review] Shutterstock {img.name}: {error}", flush=True)
+                results[img.name] = UploadStatus.NEEDS_REVIEW
+                review_names.add(img.name)
+                continue
+            if card is not None:
                 results[img.name] = UploadStatus.UPLOADED
                 print(f"  Resuming existing Shutterstock asset: {img.name}")
             else:
@@ -579,6 +594,8 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
 
         # Fill metadata for each image by locating its card by filename
         for img, meta in pairs:
+            if img.name in review_names:
+                continue
             for attempt in range(2):
                 try:
                     _dismiss_cookie_consent(page)
@@ -600,6 +617,10 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
                         raise RuntimeError("save was not confirmed")
                     print(f"  ✓ Shutterstock draft saved: {img.name}")
                     results[img.name] = UploadStatus.DRAFT_SAVED
+                    break
+                except AmbiguousAssetCardError as error:
+                    print(f"  [review] Shutterstock {img.name}: {error}", flush=True)
+                    results[img.name] = UploadStatus.NEEDS_REVIEW
                     break
                 except Exception as e:
                     if attempt == 0 and not page.is_closed():
@@ -677,6 +698,9 @@ def repair_corrections_batch(
                 print(f"  ✓ Shutterstock correction submitted: {img.name}", flush=True)
                 results[img.name] = UploadStatus.SUBMITTED
                 page.wait_for_timeout(500)
+            except AmbiguousAssetCardError as error:
+                print(f"  [review] Shutterstock {img.name}: {error}", flush=True)
+                results[img.name] = UploadStatus.NEEDS_REVIEW
             except Exception as error:
                 print(f"  ✗ Shutterstock correction: {img.name} — {error}", flush=True)
                 results[img.name] = UploadStatus.FAILED

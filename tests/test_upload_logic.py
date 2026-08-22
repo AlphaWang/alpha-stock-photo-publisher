@@ -35,6 +35,7 @@ from upload.px500 import (
 from upload.px500 import _resolve_path
 from upload.px500 import _resolution_review_reason as px500_resolution_review_reason
 import upload.px500 as px500_module
+import upload.shutterstock as shutterstock_module
 from upload.status import UploadStatus
 import upload.browser as browser_module
 from upload.confirmation import wait_for_success_text
@@ -389,15 +390,57 @@ class UploadLogicTests(unittest.TestCase):
                 return self.cards
 
         exact = _find_asset_card(
-            Page(["DSC0145.jpg backup", "DSC0145.jpg"]),
+            Page(["DSC0145.jpg backup", "2829228213 - DSC0145.jpg"]),
             "DSC0145.jpg",
         )
-        self.assertEqual(exact.inner_text(), "DSC0145.jpg")
+        self.assertEqual(exact.inner_text(), "2829228213 - DSC0145.jpg")
         with self.assertRaisesRegex(RuntimeError, "multiple Shutterstock cards"):
             _find_asset_card(
-                Page(["DSC0145.jpg", "DSC0145.jpg"]),
+                Page(["123 - DSC0145.jpg", "456 - DSC0145.jpg"]),
                 "DSC0145.jpg",
             )
+
+    def test_shutterstock_ambiguous_asset_does_not_abort_batch(self):
+        class Card:
+            def inner_text(self):
+                return "DSC0002.jpg Ready to submit"
+
+        class CardCollection:
+            def count(self):
+                return 2
+
+        class Page:
+            def goto(self, *args, **kwargs):
+                return None
+
+            def locator(self, selector):
+                return CardCollection()
+
+            def close(self):
+                return None
+
+        context = types.SimpleNamespace(new_page=lambda: Page())
+        pairs = [
+            (Path("DSC0001.jpg"), {}),
+            (Path("DSC0002.jpg"), {}),
+        ]
+
+        def find_card(page, image_name):
+            if image_name == "DSC0001.jpg":
+                raise shutterstock_module.AmbiguousAssetCardError(
+                    "multiple Shutterstock cards have the exact filename"
+                )
+            return Card()
+
+        with patch.object(shutterstock_module, "ensure_logged_in"), patch.object(
+            shutterstock_module, "_dismiss_cookie_consent"
+        ), patch.object(
+            shutterstock_module, "_find_asset_card", side_effect=find_card
+        ):
+            results = shutterstock_module.upload_batch(pairs, context)
+
+        self.assertEqual(results["DSC0001.jpg"], UploadStatus.NEEDS_REVIEW)
+        self.assertEqual(results["DSC0002.jpg"], UploadStatus.DRAFT_SAVED)
 
     def test_shutterstock_keyword_replacement_verifies_ordered_values(self):
         class Collection:

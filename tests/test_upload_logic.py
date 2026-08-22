@@ -28,7 +28,9 @@ from upload.istock import _auto_review_reason as istock_review_reason
 from upload.px500 import _auto_review_reason as px500_review_reason
 from upload.px500 import (
     _draft_save_is_confirmed as px500_save_confirmed,
+    _is_draft_save_request as px500_is_save_request,
     _save_response_is_successful as px500_response_successful,
+    _wait_for_draft_save_acknowledgement as px500_wait_for_save,
 )
 from upload.px500 import _resolve_path
 from upload.px500 import _resolution_review_reason as px500_resolution_review_reason
@@ -150,6 +152,67 @@ class UploadLogicTests(unittest.TestCase):
         self.assertFalse(px500_response_successful(failed))
         self.assertFalse(px500_response_successful(invalid))
         self.assertFalse(px500_response_successful(None))
+
+    def test_500px_failed_api_response_cannot_be_overridden_by_toast(self):
+        failed = Mock(ok=True)
+        failed.json.return_value = {"status": 500, "message": "failed"}
+
+        with patch.object(
+            px500_module,
+            "wait_for_success_text",
+            return_value=True,
+        ) as wait_for_toast:
+            self.assertFalse(
+                px500_wait_for_save(Mock(), [failed.request], [failed])
+            )
+        wait_for_toast.assert_not_called()
+
+    def test_500px_pending_api_result_remains_authoritative_after_toast(self):
+        failed = Mock(ok=True)
+        failed.json.return_value = {"status": 500, "message": "failed"}
+        responses = []
+        page = Mock()
+        page.wait_for_timeout.side_effect = lambda _: responses.append(failed)
+
+        with patch.object(
+            px500_module,
+            "wait_for_success_text",
+            return_value=True,
+        ):
+            self.assertFalse(
+                px500_wait_for_save(
+                    page,
+                    [failed.request],
+                    responses,
+                    timeout_ms=500,
+                )
+            )
+        page.wait_for_timeout.assert_called_once_with(250)
+
+    def test_500px_toast_only_save_is_confirmed_without_response_timeout(self):
+        page = Mock()
+        with patch.object(
+            px500_module,
+            "wait_for_success_text",
+            return_value=True,
+        ) as wait_for_toast:
+            self.assertTrue(px500_wait_for_save(page, [], []))
+        wait_for_toast.assert_called_once_with(
+            page,
+            ["保存成功", "草稿已保存", "操作成功"],
+            timeout=250,
+        )
+        page.wait_for_timeout.assert_not_called()
+
+    def test_500px_save_request_matches_url_with_query_string(self):
+        request = Mock(
+            method="POST",
+            url=(
+                "https://creatorstudio.500px.com.cn/"
+                "api/draftBox/123/save?source=editor"
+            ),
+        )
+        self.assertTrue(px500_is_save_request(request))
 
     def test_shutterstock_category_labels_are_canonicalized(self):
         self.assertEqual(_canonical_category("Nature"), "Nature")

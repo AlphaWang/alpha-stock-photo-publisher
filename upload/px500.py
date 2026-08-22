@@ -13,6 +13,7 @@ NOTE: Selectors based on 500px.com.cn creator studio UI as of 2026-04. Update if
 from pathlib import Path
 import json
 from typing import Optional
+from urllib.parse import urlsplit
 
 from PIL import Image
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PWTimeout
@@ -30,6 +31,8 @@ CONTRIBUTOR_BRIDGE_URL = (
     "https://500px.com.cn/page/contractPhotographer/index?type=0"
 )
 MIN_PIXEL_COUNT = 6_000_000
+_DRAFT_SAVE_SUCCESS_TEXTS = ["保存成功", "草稿已保存", "操作成功"]
+_DRAFT_SAVE_POLL_INTERVAL_MS = 250
 
 
 def _has_logged_in_session(page: Page) -> bool:
@@ -231,6 +234,76 @@ def _save_response_is_successful(response) -> bool:
     return isinstance(payload, dict) and payload.get("status") == 200
 
 
+def _is_draft_save_request(request) -> bool:
+    """Match the save endpoint by URL path so query strings remain supported."""
+    path = urlsplit(request.url).path
+    return (
+        request.method == "POST"
+        and "/api/draftBox/" in path
+        and path.endswith("/save")
+    )
+
+
+def _wait_for_draft_save_acknowledgement(
+    page: Page,
+    requests: list,
+    responses: list,
+    *,
+    timeout_ms: int = 90_000,
+) -> bool:
+    """Wait for an authoritative API result or a toast-only legacy save."""
+    elapsed = 0
+    toast_seen = False
+    while elapsed < timeout_ms:
+        if responses:
+            return _save_response_is_successful(responses[-1])
+
+        interval = min(_DRAFT_SAVE_POLL_INTERVAL_MS, timeout_ms - elapsed)
+        if toast_seen:
+            page.wait_for_timeout(interval)
+        else:
+            toast_seen = wait_for_success_text(
+                page,
+                _DRAFT_SAVE_SUCCESS_TEXTS,
+                timeout=interval,
+            )
+        elapsed += interval
+
+        if responses:
+            return _save_response_is_successful(responses[-1])
+        if toast_seen and not requests:
+            return True
+
+    return False
+
+
+def _save_draft(page: Page) -> bool:
+    """Click save while observing API and legacy toast acknowledgements."""
+    requests = []
+    responses = []
+
+    def record_request(request) -> None:
+        if _is_draft_save_request(request):
+            requests.append(request)
+
+    def record_response(response) -> None:
+        if _is_draft_save_request(response.request):
+            responses.append(response)
+
+    page.on("request", record_request)
+    page.on("response", record_response)
+    try:
+        page.locator("button:has-text('保存草稿')").first.click()
+        return _wait_for_draft_save_acknowledgement(
+            page,
+            requests,
+            responses,
+        )
+    finally:
+        page.remove_listener("request", record_request)
+        page.remove_listener("response", record_response)
+
+
 def _navigate_cascader(page: Page, path: list[str]) -> bool:
     """Click through the 3-level location cascader. Returns True on success."""
     # Open the cascader
@@ -368,30 +441,9 @@ def _fill_metadata(page: Page, metadata: dict) -> bool:
     except Exception:
         pass
 
-    # Save as draft
-    save_response = None
-    try:
-        with page.expect_response(
-            lambda response: (
-                response.request.method == "POST"
-                and "/api/draftBox/" in response.url
-                and response.url.endswith("/save")
-            ),
-            timeout=90_000,
-        ) as response_info:
-            page.locator("button:has-text('保存草稿')").first.click()
-        save_response = response_info.value
-    except PWTimeout:
-        # Older UI revisions acknowledged saves only through a transient toast.
-        pass
-
-    acknowledgement_seen = _save_response_is_successful(save_response)
-    if not acknowledgement_seen:
-        acknowledgement_seen = wait_for_success_text(
-            page,
-            ["保存成功", "草稿已保存", "操作成功"],
-            timeout=3_000,
-        )
+    # Save as draft. A matching API response is authoritative; toast-only
+    # acknowledgement is reserved for UI revisions without that request.
+    acknowledgement_seen = _save_draft(page)
     errors = page.locator(".ant-message-error, .ant-form-item-has-error")
     return _draft_save_is_confirmed(
         acknowledgement_seen,

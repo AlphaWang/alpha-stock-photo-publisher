@@ -65,6 +65,26 @@ def find_pairs(directory: Path) -> list[tuple[Path, Path]]:
     return sorted(pairs, key=lambda pair: pair[0].name)
 
 
+def find_images_without_metadata(
+    directory: Path,
+    pairs: list[tuple[Path, Path]] | None = None,
+) -> list[Path]:
+    """Return in-scope images that have no exact-source metadata pair."""
+    if pairs is None:
+        pairs = find_pairs(directory)
+    paired_images = {image.resolve() for image, _ in pairs}
+    return sorted(
+        (
+            path
+            for path in directory.iterdir()
+            if path.is_file()
+            and path.suffix.lower() in SUPPORTED_EXTS
+            and path.resolve() not in paired_images
+        ),
+        key=lambda path: path.name,
+    )
+
+
 def load_metadata(json_path: Path) -> dict:
     return json.loads(json_path.read_text(encoding="utf-8"))
 
@@ -176,7 +196,7 @@ def _validate_metadata_binding(
 _BATCH_LIMIT = {
     "shutterstock": 100,
     "px500":        100,
-    "tuchong":      100,
+    "tuchong":        3,
     "adobestock":    50,
     "istock":        50,
 }
@@ -228,6 +248,7 @@ def run_upload(
     allow_unreviewed_metadata: bool = False,
     allow_quality_warnings: bool = False,
     allow_repeated_metadata: bool = False,
+    preserve_all_frames: bool = False,
     repair_corrections: bool = False,
 ) -> bool:
     from playwright.sync_api import sync_playwright
@@ -280,6 +301,7 @@ def run_upload(
                 if metadata.get("visual_facts") is not None
             ],
             require_complete_ranking=False,
+            max_selected_per_burst=None if preserve_all_frames else 3,
         )
         if fact_batch_issues:
             facts_loaded = [
@@ -309,6 +331,7 @@ def run_upload(
                 for image, metadata in loaded
                 if metadata.get("visual_facts") is not None
             },
+            allow_full_coverage_bursts=preserve_all_frames,
         )
         if repeated and not allow_repeated_metadata:
             blocked = set(repeated)
@@ -354,7 +377,16 @@ def run_upload(
     def execute_platform(key, loaded, context):
         if key == "shutterstock":
             from upload.shutterstock import repair_corrections_batch, upload_batch
-            batch_fn = repair_corrections_batch if repair_corrections else upload_batch
+            if repair_corrections:
+                batch_fn = lambda chunk, browser_context: repair_corrections_batch(
+                    chunk, browser_context
+                )
+            else:
+                batch_fn = lambda chunk, browser_context: upload_batch(
+                    chunk,
+                    browser_context,
+                    refresh_metadata=force,
+                )
             return _run_platform_batch(
                 loaded, lambda chunk: batch_fn(chunk, context),
                 _BATCH_LIMIT[key], key,
@@ -459,6 +491,14 @@ def main() -> int:
         help="Allow repeated titles/descriptions after explicit review",
     )
     parser.add_argument(
+        "--preserve-all-frames",
+        action="store_true",
+        help=(
+            "Upload every explicitly requested, technically usable frame "
+            "without the default three-per-burst curation limit"
+        ),
+    )
+    parser.add_argument(
         "--repair-corrections",
         action="store_true",
         help=(
@@ -487,6 +527,16 @@ def main() -> int:
     if not pairs:
         sys.exit("No image+JSON pairs found. Run photo_desc.py first.")
 
+    if target.is_dir() and args.preserve_all_frames and not args.repair_corrections:
+        missing_metadata = find_images_without_metadata(target, pairs)
+        if missing_metadata:
+            names = ", ".join(path.name for path in missing_metadata)
+            sys.exit(
+                "Full-coverage upload blocked: "
+                f"{len(missing_metadata)} image(s) have no matching metadata JSON: "
+                f"{names}"
+            )
+
     print(f"Found {len(pairs)} image(s) with metadata. Platform: {args.platform}", flush=True)
     for img, jf in pairs:
         print(f"  {img.name}  ←  {jf.name}", flush=True)
@@ -503,6 +553,7 @@ def main() -> int:
         allow_unreviewed_metadata=args.allow_unreviewed_metadata,
         allow_quality_warnings=args.allow_quality_warnings,
         allow_repeated_metadata=args.allow_repeated_metadata,
+        preserve_all_frames=args.preserve_all_frames,
         repair_corrections=args.repair_corrections,
     ) else 1
 

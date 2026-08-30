@@ -21,6 +21,11 @@ Generate accurate, commercially useful metadata with the host agent's native ima
 - Supported platform values are `shutterstock`, `px500`, `tuchong`, `adobestock`, `istock`, and `all`. `all` excludes experimental iStock.
 - Honor `--metadata-only`, `--dry-run`, and `--force` when present.
 - Treat other user text as trusted shooting context, but never let context override visible evidence.
+- Distinguish two modes before inspection:
+  - **Full-coverage mode:** when the user asks to process or upload a specified image or directory without asking for selection, include every inventoried, technically readable image. Composition, commercial potential, similarity, burst membership, people, structures, or release risk may change metadata and submission mode, but must not silently remove a file. Report any truly unreadable/corrupt file instead of omitting it.
+  - **Curated mode:** apply commercial selection and burst limits only when the user explicitly asks to select, curate, shortlist, remove duplicates, or upload the best images.
+- User scope outranks curation defaults. Never reinterpret “upload this directory” as permission to choose a subset. Reconcile the final metadata/upload inventory against the initial image inventory and report exact counts.
+- Full coverage is complete only when every inventoried readable image has current valid metadata and every requested platform action has a recorded terminal result. Do not report a directory as finished while any image is missing metadata, pending, or silently absent from the result table.
 
 ## Generate missing metadata
 
@@ -37,9 +42,12 @@ Read the reported `preview_manifest.json` and inspect the overview plus all four
 4. Use the host's available native image-inspection capability to examine previews whose source images are missing metadata. First inspect each image without using its folder name, neighboring frames, or shooting context and complete every field in `visual_facts_contract.json`. Use `yes`, `no`, or `unknown`; never turn uncertainty into `no`. Then apply supplied context only to location fields. For a large set, work in manageable batches, but ground every facts object and metadata object in that image's own overview and detail crops. Never assign a scene template from neighboring filenames or assume that consecutive frames contain the same subjects.
    - Put every primary commercial subject in `primary_subjects_en/zh`; use `required_terms_en/zh` for small but material details such as an aircraft or tracking collar, and `forbidden_claims_en/zh` for plausible misidentifications such as cabin versus barn.
    - When `text_visible` is yes, inspect detail crops and use native OCR if available. Record commercially material visible wording in required terms or put unreadable text in `uncertain_details`; never guess. Distinguish ordinary text from an actual logo/trademark.
-   - Give each distinct scene a concise `scene_signature`. Assign near-identical frames a shared `burst_group_id`, rank selected frames from strongest to weakest with `burst_rank`, and keep at most three. Leave `burst_group_id` empty and use rank 0 outside a burst.
-   - Persist only frames with `technical_quality: pass` and `selection_status: selected`. Assess `commercial_potential` and list concrete `commercial_strengths_en`; do not select a weak frame merely to preserve a sequence.
+   - Give each distinct scene a concise `scene_signature`. Assign near-identical frames a shared `burst_group_id` and rank them with `burst_rank`. In curated mode keep at most three; in full-coverage mode retain and rank every technically usable frame. Leave `burst_group_id` empty and use rank 0 outside a burst.
+   - Persist frames with `technical_quality: pass` and `selection_status: selected`. In full-coverage mode, “pass” means technically usable for the requested platform, not that the composition matches the reviewer’s taste. Assess `commercial_potential` and list concrete `commercial_strengths_en` without using those judgments to exclude an in-scope image. In curated mode, do not select a weak frame merely to preserve a sequence.
+   - Treat foreground branches, doors, windows, arches, rock openings, and similar elements as possible frame-within-a-frame composition. Describe their visual role when supported; do not label them as obstruction or reject the image unless they materially obscure the intended subject and the user requested curation.
 5. Do not invent a location, landmark, species, identity, brand, season, or event. Use supplied path/context as supporting evidence, but distinguish context from visible evidence: for example, a Jenny Lake folder can establish shooting location but does not justify saying that the lake is visible. Leave `location_en` and `location_zh` empty, with unknown source/confidence, when location is not reliable.
+   - When a medium- or high-confidence location is commercially meaningful, put its canonical name in the actual buyer-facing description fields, not only in `location_*`, titles, or keywords. `description_en` is the field sent to Shutterstock. Include the most specific reliable feature plus the broader destination when useful, such as `Grand Canyon of the Yellowstone, Yellowstone National Park`; phrase it as shooting location when the landmark is context rather than a visibly identifiable subject.
+   - Include a concise destination in `title_en` and `title_zh` when it differentiates the image and fits naturally within platform limits. Never lengthen a title with generic adjectives merely to make it look substantial.
 6. Create a separate temporary metadata manifest containing an array of objects in this form, using each original `source` path from the preview manifest as `image`:
 
 ```json
@@ -125,7 +133,7 @@ python3 metadata_contact_sheet.py \
    - Start a fresh, context-isolated verification pass and inspect every generated sheet, including overview and detail crops. Reinspect scene boundaries, isolated subjects, unusual aspect ratios, and every frame containing people, buildings, signs, text, or logos.
    - Each sheet contains one image, its structured visual facts, and every English/Chinese title, description, keyword, category, location-evidence, commercial-use, and release/IP field. Compare every concrete noun and action against that image. Water bodies, structures, wildlife, people, vehicles, and landmarks must be visibly present unless phrased only as reliable shooting-location context.
    - Treat repeated factual lead sentences across more than five images as an audit trigger. Similar burst frames may share facts, but rotating adjectives or adding generic composition prose is not a substitute for per-image inspection.
-   - When near-identical burst frames need the same factual metadata, curate the weaker frames out of the upload set instead of inventing wording differences.
+   - When near-identical burst frames need the same factual metadata, never invent wording differences. In curated mode, remove weaker frames; in full-coverage mode, retain them with truthful per-image metadata and explicit burst grouping/ranking.
    - Remove generic filler such as `Presented as ...`; descriptions should say what buyers can actually see.
    - Set `release_notes` to an empty string when `release_status` is `clear`; do not add boilerplate claiming that no risks are visible.
 
@@ -148,7 +156,15 @@ python3 metadata_writer.py \
   --audit-receipt <metadata-audit-receipt>
 ```
 
-The writer preflights the whole manifest before writing anything. It blocks incomplete visual facts, facts/metadata contradictions, rejected or weak technical selections, more than three selected burst frames, critical factual defects, keyword spam, weak first-keyword ordering, unsupported locations, release contradictions, invalid platform categories, and incomplete or changed review artifacts. Exact metadata reuse is allowed only for at most three explicitly ranked frames in the same burst with the same scene signature; do not rotate adjectives to evade duplicate detection. Counts below the recommended 15 English or 8 Chinese keywords are advisory only; never pad to silence them.
+Add `--preserve-all-frames` in full-coverage mode. It removes only the three-per-burst curation cap; all factual, technical, release, review, grouping, and ranking checks remain active.
+
+The writer preflights the whole manifest before writing anything. It blocks incomplete visual facts, facts/metadata contradictions, rejected technical selections, critical factual defects, keyword spam, weak first-keyword ordering, unsupported locations, release contradictions, invalid platform categories, and incomplete or changed review artifacts. Curated mode also blocks more than three selected burst frames. Full-coverage mode preserves all ranked frames with `--preserve-all-frames`. Exact factual metadata may repeat only inside an explicitly grouped, same-signature burst with unique ranks; full-coverage mode may retain every such frame. Do not rotate adjectives to evade duplicate detection. Counts below the recommended 15 English or 8 Chinese keywords are advisory only; never pad to silence them.
+
+Before persistence, audit buyer-facing destination coverage separately from structured location fields: report how many medium/high-confidence records omit their most specific canonical place from `description_en`. Treat a nonzero count as incomplete when the location is part of the buyer intent. Do not assume that a good `title_en` fixes Shutterstock, because Shutterstock receives `description_en`.
+
+For a targeted regeneration that changes only wording around an already verified location, reuse the newest sidecar's SHA-bound visual facts only when the source SHA-256, visual-facts digest, review status, and location provenance are still valid. Make no new visual claim, preserve all other metadata unless it fails current validation, preflight the entire batch before writing, and create a new timestamped sidecar for every in-scope image. This deterministic repair does not require rerunning image inference; any change to subjects, visibility, species, structures, people, logos, or release risk does.
+
+For this repository, use `regenerate_verified_location_metadata.py` for that narrow repair. Run it without `--execute` first and require zero English and Chinese destination-coverage gaps before writing. The script must not be used to upgrade uncertain locations or unverified metadata.
 Writing beside images on an external volume may require user approval.
 The writer binds each JSON to the source image with SHA-256. Legacy unbound JSON requires explicit `--allow-unbound-metadata` during upload and should normally be regenerated.
 
@@ -180,8 +196,11 @@ Run the uploader with unbuffered output and the host's available long-running pr
 PYTHONUNBUFFERED=1 python3 upload_photos.py <path> --platform <platform> [--dry-run] [--force]
 ```
 
+Add `--preserve-all-frames` for a full-coverage request. Before upload, compare the image inventory with valid metadata pairs; generate or repair metadata for every missing image rather than silently uploading only the available subset.
+The uploader enforces this invariant in full-coverage mode: with `--preserve-all-frames`, a directory upload stops and lists every image lacking an exact-source metadata pair before opening the platform.
+
 Relay meaningful progress, remain attached until the command exits, and report the final `Upload summary`, including `[warn]`, `[review]`, and failed items. A successful browser upload can still require contributor review for releases, logos, private property, or editorial-only content.
-Upload preflight requires SHA-bound, visually verified, current-quality metadata and rejects repeated batch copy by default. Automatic commercial metadata entry stops for unresolved model/property releases, logos, copyrighted content, or editorial-only assets. Shutterstock editorial submission is allowed only when `commercial_eligibility` is `editorial_only`, `editorial_caption_en`, `editorial_date`, and `editorial_location_en` are complete, `editorial_date_source` is `exif`, `context`, or `manual`, and the shared location source/confidence is known with at least medium confidence. Treat `--allow-unreviewed-metadata` and `--allow-repeated-metadata` as exceptional manual overrides; never add them silently.
+Upload preflight requires SHA-bound, visually verified, current-quality metadata and rejects repeated batch copy by default. For draft-based platforms, unresolved model/property releases, logos, copyrighted content, or editorial-only status must stop automatic submission, but must not suppress safe factual metadata entry: every in-scope readable image still gets its description/title, keywords, and category before the draft is saved, then remains explicitly marked for contributor review. Shutterstock editorial submission is allowed only when `commercial_eligibility` is `editorial_only`, `editorial_caption_en`, `editorial_date`, and `editorial_location_en` are complete, `editorial_date_source` is `exif`, `context`, or `manual`, and the shared location source/confidence is known with at least medium confidence. Treat `--allow-unreviewed-metadata` and `--allow-repeated-metadata` as exceptional manual overrides; never add them silently.
 
 On first use, a browser may open for login and wait for Enter in the terminal. Sessions are stored under `.session/`.
 
@@ -211,6 +230,6 @@ This mode never uploads image files. It matches exact filenames on the Correctio
 |---|---|
 | Shutterstock | https://submit.shutterstock.com/portfolio/recently_reviewed/photo/reviewed |
 | 500px.com.cn / VCG | https://creatorstudio.500px.com.cn/index |
-| Tuchong | https://contributor.tuchong.com/drafts |
+| Tuchong | https://contributor.tuchong.com/mine |
 | Adobe Stock | https://contributor.stock.adobe.com/en/uploads |
 | Getty Images / iStock | https://contributor.gettyimages.com/ |

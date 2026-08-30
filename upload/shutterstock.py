@@ -138,6 +138,64 @@ def _find_asset_card(page, image_name: str):
     return matches[0] if matches else None
 
 
+def _portfolio_page_url(page_number: int) -> str:
+    return f"{PORTFOLIO_URL}?sortOrder=newest&page={page_number}"
+
+
+def _portfolio_page_count(page) -> int:
+    """Read the portfolio's ``current of total`` pagination label."""
+    try:
+        text = page.locator("body").inner_text()
+    except Exception:
+        return 1
+    totals = [int(value) for value in re.findall(r"\bof\s+(\d+)\b", text, re.I)]
+    totals.extend(
+        int(value) for value in re.findall(r"共\s*(\d+)\s*页", text)
+    )
+    return max(totals, default=1)
+
+
+def _filenames_from_card_text(text: str, targets: set[str]) -> set[str]:
+    """Extract exact target filenames from one rendered asset card."""
+    matches = set()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line in targets:
+            matches.add(line)
+            continue
+        asset_label = re.fullmatch(r"\d+\s*-\s*(.+)", line)
+        if asset_label and asset_label.group(1) in targets:
+            matches.add(asset_label.group(1))
+    return matches
+
+
+def _scan_asset_pages(page, image_names: list[str]) -> tuple[dict[str, int], set[str]]:
+    """Map exact filenames to portfolio pages and detect duplicates globally."""
+    targets = set(image_names)
+    found: dict[str, int] = {}
+    ambiguous: set[str] = set()
+    page_number = 1
+    total_pages = 1
+    while page_number <= total_pages:
+        page.goto(
+            _portfolio_page_url(page_number),
+            wait_until="domcontentloaded",
+            timeout=20_000,
+        )
+        _dismiss_cookie_consent(page)
+        page.wait_for_timeout(400)
+        total_pages = max(total_pages, _portfolio_page_count(page))
+        cards = page.locator(".MuiCard-root")
+        for index in range(cards.count()):
+            card = cards.nth(index)
+            for image_name in _filenames_from_card_text(card.inner_text(), targets):
+                if image_name in found:
+                    ambiguous.add(image_name)
+                else:
+                    found[image_name] = page_number
+        page_number += 1
+    return found, ambiguous
+
 def _canonical_category(label: str) -> str:
     cleaned = label.strip().replace("\u200b", "")
     for category, localized in CATEGORY_LABELS_ZH.items():
@@ -251,7 +309,13 @@ def _set_category(page, field: str, category: str) -> bool:
         page.keyboard.press("Escape")
         print(f"  [review] Shutterstock category unavailable: {category}")
         return False
-    option.click(timeout=5_000)
+    # The success snackbar from the previous asset can briefly cover the open
+    # menu.  A DOM click is safe here because the option has already been
+    # resolved, checked as enabled, and is scoped to the visible menu.
+    try:
+        option.click(timeout=5_000)
+    except PWTimeout:
+        option.click(timeout=5_000, force=True)
     for _ in range(25):
         if _canonical_category(control.inner_text()) == category:
             return True
@@ -308,6 +372,12 @@ def _normalized_keyword_values(values) -> list[str]:
 
 def _selected_keyword_values(page) -> list[str]:
     chips = page.locator("form [data-testid^='selected-keyword-']")
+    # Read a single DOM snapshot.  Iterating over count()/nth() races with
+    # React while keyword chips are being replaced and can leave an nth()
+    # locator waiting for an element that no longer exists.
+    if hasattr(chips, "all_inner_texts"):
+        return _normalized_keyword_values(chips.all_inner_texts())
+    # Lightweight test doubles implement only count()/nth().
     return _normalized_keyword_values(
         chips.nth(index).inner_text() for index in range(chips.count())
     )
@@ -468,12 +538,28 @@ def _fill_metadata(page, img: Path, meta: dict, *, correction: bool = False) -> 
         pass
     if save_response is not None:
         if not save_response.ok:
+            print(
+                f"  [review] {img.name}: Shutterstock validation returned "
+                f"HTTP {save_response.status}",
+                flush=True,
+            )
             return False
         try:
-            response_ready = _validation_payload_is_ready(save_response.json())
-        except Exception:
+            validation_payload = save_response.json()
+            response_ready = _validation_payload_is_ready(validation_payload)
+        except Exception as error:
+            print(
+                f"  [review] {img.name}: Shutterstock validation response "
+                f"could not be read: {error}",
+                flush=True,
+            )
             return False
         if not response_ready:
+            print(
+                f"  [review] {img.name}: Shutterstock validation did not mark "
+                f"the asset ready: {validation_payload!r}",
+                flush=True,
+            )
             return False
 
     if correction:
@@ -536,8 +622,17 @@ def _fill_metadata(page, img: Path, meta: dict, *, correction: bool = False) -> 
         return False
 
 
-def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dict[str, UploadStatus]:
-    """Upload all images in one file-chooser call, then fill metadata card by card."""
+def upload_batch(
+    pairs: list[tuple[Path, dict]],
+    context: BrowserContext,
+    *,
+    refresh_metadata: bool = False,
+) -> dict[str, UploadStatus]:
+    """Upload missing images and fill metadata across every portfolio page.
+
+    ``refresh_metadata`` rewrites existing ready drafts. Without it, ready
+    drafts retain the historical resume behavior and are left untouched.
+    """
     page = context.new_page()
     try:
         ensure_logged_in(
@@ -546,29 +641,40 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
             LOGIN_URL,
             poll_logged_in=lambda: _has_logged_in_session(page),
         )
-        page.goto(PORTFOLIO_URL, wait_until="domcontentloaded", timeout=20_000)
-        _dismiss_cookie_consent(page)
-
-        # Resume assets already present in Not submitted, uploading only missing files.
-        pre_count = page.locator(".MuiCard-root").count()
+        # Resume assets already present anywhere in Not submitted, uploading
+        # only filenames absent from every portfolio page.
+        asset_pages, ambiguous_names = _scan_asset_pages(
+            page, [img.name for img, _ in pairs]
+        )
         missing_pairs = []
         results: dict[str, UploadStatus] = {}
-        review_names: set[str] = set()
+        review_names: set[str] = set(ambiguous_names)
         for img, meta in pairs:
-            try:
-                card = _find_asset_card(page, img.name)
-            except AmbiguousAssetCardError as error:
-                print(f"  [review] Shutterstock {img.name}: {error}", flush=True)
+            if img.name in ambiguous_names:
+                print(
+                    f"  [review] Shutterstock {img.name}: multiple Shutterstock "
+                    "cards have the exact filename",
+                    flush=True,
+                )
                 results[img.name] = UploadStatus.NEEDS_REVIEW
-                review_names.add(img.name)
                 continue
-            if card is not None:
+            if img.name in asset_pages:
                 results[img.name] = UploadStatus.UPLOADED
                 print(f"  Resuming existing Shutterstock asset: {img.name}")
             else:
                 missing_pairs.append((img, meta))
 
         if missing_pairs:
+            # Large batches can legitimately take well beyond five minutes to
+            # transfer and process.  Scale the wait while retaining the former
+            # five-minute floor for small batches.
+            batch_timeout_ms = max(300_000, len(missing_pairs) * 15_000)
+            page.goto(
+                _portfolio_page_url(1),
+                wait_until="domcontentloaded",
+                timeout=20_000,
+            )
+            _dismiss_cookie_consent(page)
             page.locator("button.MuiButton-contained:has-text('Upload')").click()
             page.wait_for_selector("button:has-text('Upload assets')", timeout=10_000)
             with page.expect_file_chooser() as fc_info:
@@ -578,61 +684,91 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
 
             page.wait_for_function(
                 "() => /Upload complete|上传完成/i.test(document.body.innerText)",
-                timeout=300_000,
+                timeout=batch_timeout_ms,
             )
-            page.goto(PORTFOLIO_URL, wait_until="networkidle", timeout=60_000)
-            _dismiss_cookie_consent(page)
-            expected = pre_count + len(missing_pairs)
-            page.wait_for_function(
-                f"() => document.querySelectorAll('.MuiCard-root').length >= {expected}",
-                timeout=300_000,
-            )
+            unresolved = [img.name for img, _ in missing_pairs]
+            ambiguous_after_upload: set[str] = set()
+            for scan_attempt in range(12):
+                asset_pages, ambiguous_after_upload = _scan_asset_pages(
+                    page, [img.name for img, _ in pairs]
+                )
+                unresolved = [
+                    img.name for img, _ in missing_pairs if img.name not in asset_pages
+                ]
+                if not unresolved:
+                    break
+                if scan_attempt < 11:
+                    print(
+                        f"  Waiting for Shutterstock to process {len(unresolved)} file(s)...",
+                        flush=True,
+                    )
+                    page.wait_for_timeout(5_000)
+            if unresolved:
+                raise RuntimeError(
+                    "uploaded Shutterstock assets were not found by exact filename: "
+                    + ", ".join(unresolved)
+                )
+            for image_name in ambiguous_after_upload:
+                results[image_name] = UploadStatus.NEEDS_REVIEW
+                review_names.add(image_name)
             for img, _ in missing_pairs:
-                results[img.name] = UploadStatus.UPLOADED
+                if img.name not in review_names:
+                    results[img.name] = UploadStatus.UPLOADED
         else:
             print("  All files already exist in Shutterstock; skipping transfer")
 
-        # Fill metadata for each image by locating its card by filename
+        # Fill metadata page by page so older drafts are updated in place
+        # instead of being mistaken for missing uploads.
+        pairs_by_page: dict[int, list[tuple[Path, dict]]] = {}
         for img, meta in pairs:
-            if img.name in review_names:
-                continue
-            for attempt in range(2):
-                try:
-                    _dismiss_cookie_consent(page)
-                    card = _find_asset_card(page, img.name)
-                    if card is None:
-                        raise RuntimeError("asset card was not found by exact filename")
-                    if _asset_card_is_ready(card.inner_text()):
-                        print(f"  ✓ Shutterstock draft already ready: {img.name}")
+            if img.name not in review_names and img.name in asset_pages:
+                pairs_by_page.setdefault(asset_pages[img.name], []).append((img, meta))
+
+        for page_number, page_pairs in sorted(pairs_by_page.items()):
+            page.goto(
+                _portfolio_page_url(page_number),
+                wait_until="domcontentloaded",
+                timeout=20_000,
+            )
+            _dismiss_cookie_consent(page)
+            page.wait_for_timeout(400)
+            for img, meta in page_pairs:
+                for attempt in range(2):
+                    try:
+                        card = _find_asset_card(page, img.name)
+                        if card is None:
+                            raise RuntimeError("asset card was not found by exact filename")
+                        if _asset_card_is_ready(card.inner_text()) and not refresh_metadata:
+                            print(f"  ✓ Shutterstock draft already ready: {img.name}")
+                            results[img.name] = UploadStatus.DRAFT_SAVED
+                            break
+                        card.scroll_into_view_if_needed()
+                        bbox = card.bounding_box()
+                        page.mouse.click(
+                            bbox["x"] + bbox["width"] / 2,
+                            bbox["y"] + bbox["height"] * 0.35,
+                        )
+
+                        if not _fill_metadata(page, img, meta):
+                            raise RuntimeError("save was not confirmed")
+                        print(f"  ✓ Shutterstock draft saved: {img.name}")
                         results[img.name] = UploadStatus.DRAFT_SAVED
                         break
-                    card.scroll_into_view_if_needed()
-                    bbox = card.bounding_box()
-                    page.mouse.click(
-                        bbox["x"] + bbox["width"] / 2,
-                        bbox["y"] + bbox["height"] * 0.35,
-                    )
-
-                    if not _fill_metadata(page, img, meta):
-                        raise RuntimeError("save was not confirmed")
-                    print(f"  ✓ Shutterstock draft saved: {img.name}")
-                    results[img.name] = UploadStatus.DRAFT_SAVED
-                    break
-                except AmbiguousAssetCardError as error:
-                    print(f"  [review] Shutterstock {img.name}: {error}", flush=True)
-                    results[img.name] = UploadStatus.NEEDS_REVIEW
-                    break
-                except Exception as e:
-                    if attempt == 0 and not page.is_closed():
-                        print(
-                            f"  [retry] Shutterstock {img.name}: {e}",
-                            flush=True,
-                        )
-                        page.keyboard.press("Escape")
-                        page.wait_for_timeout(500)
-                        continue
-                    print(f"  ✗ Shutterstock: {img.name} — {e}")
-                    results[img.name] = UploadStatus.UPLOADED
+                    except AmbiguousAssetCardError as error:
+                        print(f"  [review] Shutterstock {img.name}: {error}", flush=True)
+                        results[img.name] = UploadStatus.NEEDS_REVIEW
+                        break
+                    except Exception as e:
+                        if attempt == 0 and not page.is_closed():
+                            print(
+                                f"  [retry] Shutterstock {img.name}: {e}",
+                                flush=True,
+                            )
+                            page.keyboard.press("Escape")
+                            page.wait_for_timeout(500)
+                            continue
+                        print(f"  ✗ Shutterstock: {img.name} — {e}")
+                        results[img.name] = UploadStatus.FAILED
 
         return results
 

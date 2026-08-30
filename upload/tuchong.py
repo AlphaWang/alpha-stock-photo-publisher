@@ -11,6 +11,7 @@ Upload flow (contributor.tuchong.com):
 NOTE: Selectors based on contributor.tuchong.com UI as of 2026-04. Update if the site changes.
 """
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +31,8 @@ _CATEGORY_MAP: dict[str, list[str]] = {
     "Travel":       ["自然风光", "城市风光"],
     "Architecture": ["城市风光"],
     "Buildings":    ["城市风光"],
+    "Interiors":    ["室内空间"],
+    "Religion":     ["其他"],
     "Backgrounds/Textures": ["自然风光"],
     "Industrial":   ["城市风光"],
     "Parks/Outdoor": ["自然风光"],
@@ -120,19 +123,34 @@ def _categories_for_metadata(metadata: dict) -> list[str]:
     return categories[:2]
 
 
-def _fill_metadata(page: Page, metadata: dict) -> bool:
-    """Fill required metadata and report whether every required field succeeded."""
+@dataclass(frozen=True)
+class _MetadataFillResult:
+    fields_verified: bool
+    submission_ready: bool
+
+    def __bool__(self) -> bool:
+        return self.submission_ready
+
+
+def _fill_metadata(page: Page, metadata: dict) -> _MetadataFillResult:
+    """Fill required metadata and report whether the draft is submission-ready.
+
+    Release, logo, copyright, and commercial-eligibility warnings must not leave
+    a draft blank.  They require contributor review before submission, while the
+    factual description, keywords, and category are still safe and useful draft
+    metadata.
+    """
     description = metadata.get("description_zh", "")[:50]
     keywords = metadata.get("keywords_zh", [])[:30]
     if not description or not keywords:
         print("  [review] description or keywords are missing")
-        return False
+        return _MetadataFillResult(False, False)
     commercial_reason = commercial_submission_review_reason(metadata)
     if commercial_reason:
         print(f"  [review] {commercial_reason}")
-        return False
 
-    complete = True
+    fields_verified = True
+    submission_ready = not bool(commercial_reason)
     # Scope all lookups to the sider form to avoid stray element matches
     form = page.locator("form.contribute__sider-form")
     try:
@@ -167,33 +185,32 @@ def _fill_metadata(page: Page, metadata: dict) -> bool:
             selected_categories = len(cats)
         else:
             category_input.click(timeout=5_000)
-            # Wait for the modal and its slide-in animation to finish.
-            page.wait_for_selector("text=摄影图片类", timeout=10_000)
+            # Wait for the modal itself. Its heading text has changed across
+            # Tuchong releases, while the accessible dialog role is stable.
+            dialog = page.locator("[role='dialog']:visible").last
+            dialog.wait_for(state="visible", timeout=10_000)
             page.wait_for_timeout(600)
             selected_categories = 0
             for cat in cats:
                 try:
-                    dialog = page.locator("[role='dialog']")
-                    target = (
-                        dialog.locator(f"text={cat}").first
-                        if dialog.count() > 0
-                        else page.locator(f"text={cat}").first
-                    )
+                    target = dialog.get_by_text(cat, exact=True).first
                     target.click(timeout=5_000)
                     selected_categories += 1
                     page.wait_for_timeout(400)
                 except PWTimeout:
                     pass
-            page.locator(
+            dialog.locator(
                 "button:has-text('确认'), button:has-text('确 认')"
             ).first.click(timeout=5_000)
             page.wait_for_timeout(1_000)
         if selected_categories == 0:
-            complete = False
+            fields_verified = False
             print("  [warn] no image category could be selected")
     except PWTimeout as e:
         print(f"  [warn] category field failed: {e}")
-        complete = False
+        fields_verified = False
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
 
     # Image description — <textarea class="ant-input contribute-form-model" maxlength="50">
     try:
@@ -213,7 +230,7 @@ def _fill_metadata(page: Page, metadata: dict) -> bool:
         page.wait_for_timeout(200)
     except Exception as e:
         print(f"  [warn] description field failed: {e}")
-        complete = False
+        fields_verified = False
 
     # Keywords — Ant Design Select (tags/multiple mode)
     # .ant-select-selection--multiple contains a hidden input.ant-select-search__field
@@ -238,9 +255,42 @@ def _fill_metadata(page: Page, metadata: dict) -> bool:
             page.wait_for_timeout(80)
     except Exception as e:
         print(f"  [warn] keywords field failed: {e}")
-        complete = False
+        fields_verified = False
 
-    return complete
+    # A successful fill/click call is not enough: Ant Design can silently drop
+    # changes while the form is initializing.  Read the active form back before
+    # any draft is saved so blank or partial metadata cannot be reported ready.
+    try:
+        actual_description = form.locator("textarea.ant-input").first.input_value().strip()
+        actual_category = form.locator(
+            "input.ant-input[placeholder='请选择']"
+        ).first.input_value().strip()
+        actual_keywords = {
+            value.strip()
+            for value in form.locator(
+                ".ant-select-selection--multiple .ant-select-selection__choice"
+            ).all_inner_texts()
+            if value.strip()
+        }
+        missing_keywords = [kw for kw in keywords if kw not in actual_keywords]
+        missing_categories = [cat for cat in cats if cat not in actual_category]
+        if actual_description != description:
+            print("  [warn] description did not remain in the active form")
+            fields_verified = False
+        if not actual_category or missing_categories:
+            print("  [warn] category did not remain in the active form")
+            fields_verified = False
+        if len(actual_keywords) < 5 or missing_keywords:
+            print("  [warn] keywords did not remain in the active form")
+            fields_verified = False
+    except Exception as e:
+        print(f"  [warn] metadata read-back failed: {e}")
+        fields_verified = False
+
+    return _MetadataFillResult(
+        fields_verified=fields_verified,
+        submission_ready=fields_verified and submission_ready,
+    )
 
 
 def _selected_card_count(page: Page) -> int:
@@ -264,17 +314,17 @@ def _select_card_for_edit(page: Page, img: Path, idx: int = 0) -> None:
     page.wait_for_timeout(200)
 
     # Try full filename first; Tuchong may truncate long names in the UI,
-    # so fall back to stem (no extension), then by position.
+    # so fall back to the stem. Never edit by position because a failed or
+    # deduplicated upload can shift cards and attach metadata to the wrong file.
     for locator in [
         page.locator(".contribute__image__item").filter(has=page.get_by_text(img.name, exact=False)).first,
         page.locator(".contribute__image__item").filter(has=page.get_by_text(img.stem, exact=False)).first,
-        page.locator(".contribute__image__item").nth(idx),
     ]:
         if locator.count() > 0:
             card = locator
             break
     else:
-        card = page.locator(".contribute__image__item").nth(idx)
+        raise PWTimeout(f"upload card not found for {img.name}")
 
     card.wait_for(state="attached", timeout=30_000)
     card.scroll_into_view_if_needed()
@@ -320,8 +370,13 @@ def _check_pledge(page: Page) -> None:
             pass
 
 
+def _upload_status_is_pending(status: str) -> bool:
+    """Return whether a Tuchong card is still queued or being processed."""
+    return "等待上传中" in status or "上传中" in status
+
+
 def _wait_for_uploads(page: Page, count: int) -> None:
-    """Wait for all upload cards to finish (no per-card uploading indicator)."""
+    """Wait until every upload card leaves its queued/processing state."""
     try:
         page.wait_for_selector(".contribute__image__item", timeout=30_000)
     except PWTimeout:
@@ -336,17 +391,14 @@ def _wait_for_uploads(page: Page, count: int) -> None:
                 '.contribute__image__item .upload-process-each__text'
             )].map(el => el.textContent.trim())"""
         )
-        # Only wait for files actively mid-transfer (X% < 100).
-        # '上传中 100%' = fully transferred; '等待上传中' = queued but not started.
-        # Both are treated as "done enough to proceed" — _card_error handles the rest.
-        in_progress = sum(
-            1 for s in statuses
-            if '上传中' in s and '100%' not in s and '等待上传中' not in s
-        )
-        if in_progress == 0:
+        # Tuchong keeps the form disabled while a card says either
+        # "等待上传中" or "上传中 100%".  The latter means transfer reached
+        # 100%, not that server-side processing and form initialization ended.
+        pending = sum(1 for status in statuses if _upload_status_is_pending(status))
+        if pending == 0:
             break
         status_summary = ", ".join(dict.fromkeys(statuses))
-        print(f"  [wait] {in_progress}/{count} mid-transfer: {status_summary}", flush=True)
+        print(f"  [wait] {pending}/{count} queued/processing: {status_summary}", flush=True)
         page.wait_for_timeout(check_ms)
         elapsed_ms += check_ms
     else:
@@ -356,22 +408,33 @@ def _wait_for_uploads(page: Page, count: int) -> None:
 
 def _card_error(page: Page, filename: str) -> Optional[str]:
     """Return the error text on a card, or None if the upload succeeded."""
-    return page.evaluate(
+    status = page.evaluate(
         """(filename) => {
             const cards = [...document.querySelectorAll('.contribute__image__item')];
             const card = cards.find(c => c.innerText.includes(filename));
-            if (!card) return null;
+            if (!card) return 'upload card not found';
             const el = card.querySelector('.upload-process-each__text');
             if (!el) return null;
-            const text = el.textContent.trim();
-            // File is still queued (never started uploading) — treat as not uploaded
-            if (text.includes('等待上传中')) return '等待上传中';
-            // File is actively uploading or fully transferred — no error
-            if (text.includes('上传中')) return null;
-            return text;
+            return el.textContent.trim() || null;
         }""",
         filename,
     )
+    # A lingering queue/progress label is not success, including "上传中 100%".
+    # Successful cards remove the status element; other non-empty labels are
+    # platform errors and should also remain retryable/reviewable.
+    return status or None
+
+
+def _saved_draft_status(
+    filename: str,
+    metadata_ready: set[str],
+    metadata_populated: set[str],
+) -> UploadStatus:
+    if filename in metadata_ready:
+        return UploadStatus.DRAFT_SAVED
+    if filename in metadata_populated:
+        return UploadStatus.DRAFT_SAVED_NEEDS_REVIEW
+    return UploadStatus.UPLOADED
 
 
 def _delete_card(page: Page, filename: str) -> None:
@@ -471,6 +534,7 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
         # Each image has its own JSON metadata. Never edit metadata while the
         # whole batch is selected, because Tuchong applies changed fields to
         # every selected file.
+        metadata_populated: set[str] = set()
         metadata_ready: set[str] = set()
         for fill_idx, (img, metadata) in enumerate(ok_pairs):
             try:
@@ -491,11 +555,23 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
                 print(f"  [warn] form still disabled for {img.name}")
             page.wait_for_timeout(300)
 
-            if _fill_metadata(page, metadata):
+            fill_result = _fill_metadata(page, metadata)
+            if fill_result.fields_verified:
+                metadata_populated.add(img.name)
+            if fill_result.submission_ready:
                 metadata_ready.add(img.name)
                 print(f"  [{fill_idx + 1}/{len(ok_pairs)}] ready {img.name}", flush=True)
+            elif fill_result.fields_verified:
+                print(
+                    f"  [{fill_idx + 1}/{len(ok_pairs)}] metadata saved; "
+                    f"submission review required {img.name}",
+                    flush=True,
+                )
             else:
-                print(f"  [{fill_idx + 1}/{len(ok_pairs)}] review required {img.name}", flush=True)
+                print(
+                    f"  [{fill_idx + 1}/{len(ok_pairs)}] metadata incomplete {img.name}",
+                    flush=True,
+                )
 
         if ok_pairs:
             _check_pledge(page)
@@ -503,13 +579,42 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
                 # Save once at the end. Selecting the batch here is only for the
                 # save action; no metadata fields are modified after this point.
                 _select_all_for_save(page, len(ok_pairs))
-                page.locator("button:has-text('保存草稿')").first.click(timeout=5_000)
-                if wait_for_success_text(page, ["保存成功", "草稿已保存", "操作成功"]):
+                save_button = page.locator("button:has-text('保存草稿')").first
+                save_response = None
+                try:
+                    with page.expect_response(
+                        lambda response: (
+                            "/api/creative/groups" in response.url
+                            and response.request.method != "GET"
+                        ),
+                        timeout=15_000,
+                    ) as response_info:
+                        save_button.click(timeout=5_000)
+                    save_response = response_info.value
+                except PWTimeout:
+                    # Older Tuchong versions reported success only through a
+                    # visible toast, so retain that path as a fallback.
+                    pass
+
+                api_confirmed = False
+                if save_response is not None and save_response.ok:
+                    try:
+                        payload = save_response.json()
+                        data = payload.get("data") or {}
+                        api_confirmed = (
+                            payload.get("code") == 0
+                            and data.get("success_num") == len(ok_pairs)
+                        )
+                    except Exception:
+                        api_confirmed = False
+
+                toast_confirmed = wait_for_success_text(
+                    page, ["保存成功", "草稿已保存", "操作成功"]
+                )
+                if api_confirmed or toast_confirmed:
                     for img, _ in ok_pairs:
-                        results[img.name] = (
-                            UploadStatus.DRAFT_SAVED
-                            if img.name in metadata_ready
-                            else UploadStatus.UPLOADED
+                        results[img.name] = _saved_draft_status(
+                            img.name, metadata_ready, metadata_populated
                         )
                     print(f"  Saved Tuchong draft once for {len(ok_pairs)} image(s)", flush=True)
                 else:

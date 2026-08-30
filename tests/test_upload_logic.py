@@ -23,6 +23,9 @@ from upload.adobestock import _auto_review_reason as adobe_review_reason
 from upload.adobestock import _extract_original_filename as adobe_original_filename
 from upload.adobestock import _has_logged_in_session as adobe_session_ready
 from upload.adobestock import _resolve_category as resolve_adobe_category
+from upload.adobestock import _technical_review_reason as adobe_technical_review_reason
+from upload.adobestock import _total_asset_count as adobe_total_asset_count
+from upload.adobestock import _wait_for_uploaded_tiles as adobe_wait_for_tiles
 from upload.adobestock import upload_batch as upload_adobe_batch
 from upload.istock import _auto_review_reason as istock_review_reason
 from upload.px500 import _auto_review_reason as px500_review_reason
@@ -46,6 +49,7 @@ from upload.shutterstock import (
     _correction_was_resubmitted,
     _find_asset_card,
     _keyword_count_from_text,
+    _portfolio_page_count,
     _replace_keywords,
     _set_usage,
     _submission_mode,
@@ -53,6 +57,10 @@ from upload.shutterstock import (
     _has_logged_in_session as shutterstock_session_ready,
 )
 from upload.tuchong import _login_page_session_ready as tuchong_login_ready
+from upload.tuchong import _card_error as tuchong_card_error
+from upload.tuchong import _saved_draft_status as tuchong_saved_draft_status
+from upload.tuchong import _categories_for_metadata as tuchong_categories
+from upload.tuchong import _upload_status_is_pending as tuchong_upload_pending
 from upload_photos import (
     _image_digest,
     _history_entry_completed,
@@ -60,6 +68,7 @@ from upload_photos import (
     _platform_enabled,
     _save_history,
     _validate_metadata_binding,
+    find_images_without_metadata,
     find_pairs,
 )
 from upload_photos import _result_counts
@@ -101,6 +110,27 @@ def complete_bound_metadata(image, *, include_hash=True, verified=True):
 
 
 class UploadLogicTests(unittest.TestCase):
+    def test_full_coverage_inventory_detects_every_image_without_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            covered = directory / "covered.jpg"
+            missing_a = directory / "missing-a.jpg"
+            missing_b = directory / "missing-b.png"
+            ignored = directory / "notes.txt"
+            for path in (covered, missing_a, missing_b, ignored):
+                path.write_bytes(b"test")
+            metadata_path = directory / "covered.json"
+            metadata_path.write_text(
+                json.dumps({"source": covered.name}), encoding="utf-8"
+            )
+
+            pairs = find_pairs(directory)
+
+            self.assertEqual(
+                [path.name for path in find_images_without_metadata(directory, pairs)],
+                ["missing-a.jpg", "missing-b.png"],
+            )
+
     def test_agent_native_upload_requires_bound_visual_facts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             image = Path(temp_dir) / "photo.jpg"
@@ -400,6 +430,18 @@ class UploadLogicTests(unittest.TestCase):
                 "DSC0145.jpg",
             )
 
+    def test_shutterstock_page_count_accepts_split_current_page_input(self):
+        class Body:
+            def inner_text(self):
+                return "Not submitted (474)\n2\nof 5"
+
+        class Page:
+            def locator(self, selector):
+                self.assert_selector = selector
+                return Body()
+
+        self.assertEqual(_portfolio_page_count(Page()), 5)
+
     def test_shutterstock_ambiguous_asset_does_not_abort_batch(self):
         class Card:
             def inner_text(self):
@@ -411,6 +453,9 @@ class UploadLogicTests(unittest.TestCase):
 
         class Page:
             def goto(self, *args, **kwargs):
+                return None
+
+            def wait_for_timeout(self, timeout):
                 return None
 
             def locator(self, selector):
@@ -434,6 +479,10 @@ class UploadLogicTests(unittest.TestCase):
 
         with patch.object(shutterstock_module, "ensure_logged_in"), patch.object(
             shutterstock_module, "_dismiss_cookie_consent"
+        ), patch.object(
+            shutterstock_module,
+            "_scan_asset_pages",
+            return_value=({"DSC0002.jpg": 1}, {"DSC0001.jpg"}),
         ), patch.object(
             shutterstock_module, "_find_asset_card", side_effect=find_card
         ):
@@ -891,6 +940,70 @@ class UploadLogicTests(unittest.TestCase):
         self.assertEqual(resolve_adobe_category("Business/Finance"), "Business")
         self.assertIsNone(resolve_adobe_category("Not a category"))
 
+    def test_adobe_technical_limits_require_review_before_browser_upload(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir) / "oversized.jpg"
+            image.write_bytes(b"jpeg placeholder")
+            opened = Mock()
+            opened.__enter__ = Mock(return_value=opened)
+            opened.__exit__ = Mock(return_value=False)
+            opened.format = "JPEG"
+            opened.size = (25_000, 4_001)
+            with patch("upload.adobestock.Image.open", return_value=opened):
+                self.assertIn("maximum is 100MP", adobe_technical_review_reason(image))
+
+            metadata = {
+                "title_en": "Mountain panorama",
+                "keywords_en": ["mountain", "panorama", "nature", "travel", "landscape"],
+                "release_status": "clear",
+                "category1": "Nature",
+            }
+
+            class NoBrowserContext:
+                def new_page(self):
+                    raise AssertionError("oversized images must be filtered before browser upload")
+
+            with patch("upload.adobestock.Image.open", return_value=opened):
+                result = upload_adobe_batch([(image, metadata)], NoBrowserContext())
+            self.assertEqual(result, {"oversized.jpg": UploadStatus.NEEDS_REVIEW})
+
+    def test_adobe_continues_when_only_accepted_files_create_tiles(self):
+        class Locator:
+            def count(self):
+                return 12
+
+        class Page:
+            def locator(self, selector):
+                return Locator()
+
+            def wait_for_timeout(self, timeout):
+                return None
+
+        self.assertEqual(
+            adobe_wait_for_tiles(
+                Page(), pre_count=10, requested_count=3, stable_ms=0
+            ),
+            12,
+        )
+
+    def test_adobe_uses_gallery_total_instead_of_first_page_tile_count(self):
+        class Locator:
+            @property
+            def first(self):
+                return self
+
+            def inner_text(self):
+                return "File types: All (121)"
+
+            def count(self):
+                return 100
+
+        class Page:
+            def locator(self, selector):
+                return Locator()
+
+        self.assertEqual(adobe_total_asset_count(Page()), 121)
+
     def test_release_notes_block_automatic_submission(self):
         metadata = {
             "title_en": "City street",
@@ -906,7 +1019,8 @@ class UploadLogicTests(unittest.TestCase):
             def new_page(self):
                 raise AssertionError("review items must be filtered before browser upload")
 
-        result = upload_adobe_batch([(Path("city.jpg"), metadata)], NoBrowserContext())
+        with patch("upload.adobestock._technical_review_reason", return_value=""):
+            result = upload_adobe_batch([(Path("city.jpg"), metadata)], NoBrowserContext())
         self.assertEqual(result, {"city.jpg": UploadStatus.NEEDS_REVIEW})
 
     def test_unknown_location_blocks_500px_upload(self):
@@ -1017,6 +1131,8 @@ class UploadLogicTests(unittest.TestCase):
         self.assertTrue(UploadStatus.UPLOADED.recordable)
         self.assertFalse(UploadStatus.UPLOADED.completed)
         self.assertTrue(UploadStatus.DRAFT_SAVED.completed)
+        self.assertTrue(UploadStatus.DRAFT_SAVED_NEEDS_REVIEW.recordable)
+        self.assertTrue(UploadStatus.DRAFT_SAVED_NEEDS_REVIEW.completed)
         self.assertTrue(UploadStatus.SUBMITTED.completed)
         self.assertFalse(UploadStatus.NEEDS_REVIEW.recordable)
         self.assertFalse(UploadStatus.NEEDS_REVIEW.completed)
@@ -1150,6 +1266,38 @@ class UploadLogicTests(unittest.TestCase):
         page = Page()
         self.assertTrue(tuchong_login_ready(page))
         self.assertEqual(page.evaluations, 1)
+
+    def test_tuchong_upload_status_waits_for_queue_and_server_processing(self):
+        self.assertTrue(tuchong_upload_pending("等待上传中"))
+        self.assertTrue(tuchong_upload_pending("上传中 37%"))
+        self.assertTrue(tuchong_upload_pending("上传中 100%"))
+        self.assertFalse(tuchong_upload_pending(""))
+        self.assertFalse(tuchong_upload_pending("Network Error"))
+
+    def test_tuchong_progress_card_is_not_treated_as_uploaded(self):
+        class Page:
+            def evaluate(self, expression, filename):
+                return "上传中 100%"
+
+        self.assertEqual(tuchong_card_error(Page(), "photo.jpg"), "上传中 100%")
+
+    def test_tuchong_incomplete_metadata_remains_resumable(self):
+        status = tuchong_saved_draft_status("photo.jpg", set(), set())
+
+        self.assertEqual(status, UploadStatus.UPLOADED)
+        self.assertFalse(status.completed)
+
+    def test_tuchong_maps_religious_interiors_to_valid_draft_categories(self):
+        self.assertEqual(
+            tuchong_categories(
+                {
+                    "category1": "Religion",
+                    "category2": "Interiors",
+                    "platform_categories": {"tuchong": []},
+                }
+            ),
+            ["其他", "室内空间"],
+        )
 
     def test_success_confirmation_uses_keyword_only_playwright_arg(self):
         class Page:

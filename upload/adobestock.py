@@ -16,8 +16,10 @@ Adobe uses the Spectrum design system; category picker is a custom FieldButton, 
 
 from pathlib import Path
 import re
+import warnings
 from typing import Optional
 
+from PIL import Image
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PWTimeout
 
 from .browser import ensure_logged_in
@@ -27,6 +29,10 @@ from metadata_core import commercial_submission_review_reason, platform_category
 
 PORTAL_URL = "https://contributor.stock.adobe.com/"
 LOGIN_URL = PORTAL_URL
+
+_MIN_PIXELS = 4_000_000
+_MAX_PIXELS = 100_000_000
+_MAX_FILE_BYTES = 45_000_000
 
 # Adobe Stock categories (21 options as of 2026-04)
 _CATEGORY_MAP: dict[str, str] = {
@@ -83,6 +89,34 @@ def _auto_review_reason(meta: dict) -> str:
         return commercial_reason
     if _category_for_metadata(meta) is None:
         return "category cannot be mapped to Adobe Stock"
+    return ""
+
+
+def _technical_review_reason(image_path: Path) -> str:
+    """Return an Adobe photo-spec violation that requires manual preparation."""
+    try:
+        file_size = image_path.stat().st_size
+    except OSError as exc:
+        return f"image cannot be read ({exc})"
+    if file_size > _MAX_FILE_BYTES:
+        return f"file is {file_size / 1_000_000:.1f}MB (Adobe maximum is 45MB)"
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            with Image.open(image_path) as image:
+                image_format = image.format
+                width, height = image.size
+    except Exception as exc:
+        return f"image cannot be inspected ({exc})"
+
+    if image_format != "JPEG":
+        return f"file format is {image_format or 'unknown'} (Adobe photos require JPEG)"
+    pixels = width * height
+    if pixels < _MIN_PIXELS:
+        return f"image is {pixels / 1_000_000:.2f}MP (Adobe minimum is 4MP)"
+    if pixels > _MAX_PIXELS:
+        return f"image is {pixels / 1_000_000:.2f}MP (Adobe maximum is 100MP)"
     return ""
 
 
@@ -154,6 +188,61 @@ def _count_tiles(page: Page) -> int:
     return page.locator(_TILE_SEL).count()
 
 
+def _total_asset_count(page: Page) -> int:
+    """Read the gallery total, falling back to the current page's tile count."""
+    try:
+        text = page.locator("button:has-text('File types: All')").first.inner_text()
+        match = re.search(r"\((\d+)\)", text)
+        if match:
+            return int(match.group(1))
+    except Exception:
+        pass
+    return _count_tiles(page)
+
+
+def _wait_for_uploaded_tiles(
+    page: Page,
+    pre_count: int,
+    requested_count: int,
+    *,
+    timeout_ms: int = 180_000,
+    stable_ms: int = 30_000,
+    poll_ms: int = 2_000,
+) -> int:
+    """Wait for accepted uploads without requiring every file to become a tile."""
+    expected = pre_count + requested_count
+    last_count = pre_count
+    stable_for = 0
+    elapsed = 0
+    while elapsed <= timeout_ms:
+        current = _total_asset_count(page)
+        if current >= expected:
+            return current
+        if current != last_count:
+            last_count = current
+            stable_for = 0
+        elif current > pre_count and stable_for >= stable_ms:
+            print(
+                f"  [warn] Adobe created {current - pre_count}/{requested_count} "
+                "new tile(s); continuing with accepted files",
+                flush=True,
+            )
+            return current
+        page.wait_for_timeout(poll_ms)
+        elapsed += poll_ms
+        stable_for += poll_ms
+
+    current = _total_asset_count(page)
+    if current > pre_count:
+        print(
+            f"  [warn] Adobe created {current - pre_count}/{requested_count} "
+            "new tile(s) before timeout; continuing with accepted files",
+            flush=True,
+        )
+        return current
+    raise TimeoutError("Adobe did not create any upload tiles before timeout")
+
+
 def _extract_original_filename(footer: str) -> Optional[str]:
     match = re.search(
         r"Original name\(s\):\s*(.+?)(?:\s*Actions:|[\r\n]|$)", footer
@@ -161,21 +250,50 @@ def _extract_original_filename(footer: str) -> Optional[str]:
     return match.group(1).strip() if match else None
 
 
-def _build_tile_map(page: Page, start: int, total: int) -> dict[str, int]:
-    """Scan tiles and return original filename → current tile-index mapping."""
-    mapping: dict[str, int] = {}
+def _go_to_tile_page(page: Page, page_number: int) -> None:
+    if page_number == 1 and _total_asset_count(page) <= 100:
+        return
+    page_input = page.locator("input[name='searchPage']").first
+    page_input.fill(str(page_number))
+    page_input.press("Enter")
+    page.wait_for_timeout(1_500)
+
+
+def _build_current_page_tile_map(page: Page, page_number: int) -> dict[str, tuple[int, int]]:
+    """Scan the visible page and return filename → (page, tile index)."""
+    mapping: dict[str, tuple[int, int]] = {}
     tiles = page.locator(_TILE_SEL)
-    for idx in range(start, total):
+    for idx in range(tiles.count()):
         try:
             tiles.nth(idx).click()
-            page.wait_for_timeout(400)
+            page.wait_for_timeout(250)
             footer = page.locator("[data-t='asset-sidebar-footer']").inner_text(timeout=3_000)
             filename = _extract_original_filename(footer)
             if filename:
-                mapping[filename] = idx
+                mapping[filename] = (page_number, idx)
         except Exception:
             pass
     return mapping
+
+
+def _build_tile_map(page: Page) -> dict[str, tuple[int, int]]:
+    """Scan every Adobe gallery page, not just the first 100 tiles."""
+    total = _total_asset_count(page)
+    page_count = max(1, (total + 99) // 100)
+    mapping: dict[str, tuple[int, int]] = {}
+    for page_number in range(1, page_count + 1):
+        _go_to_tile_page(page, page_number)
+        mapping.update(_build_current_page_tile_map(page, page_number))
+    _go_to_tile_page(page, 1)
+    return mapping
+
+
+def _upload_button_enabled(page: Page) -> bool:
+    button = page.locator("button:has-text('Upload')").first
+    if button.count() == 0:
+        return False
+    classes = button.get_attribute("class") or ""
+    return not button.is_disabled() and "is-disabled" not in classes
 
 
 def _set_category(page: Page, category: str) -> bool:
@@ -299,12 +417,50 @@ def _fill_metadata(page: Page, img: Path, meta: dict) -> bool:
         return False
 
 
+def _fill_mapped_metadata(
+    page: Page,
+    pairs: list[tuple[Path, dict]],
+    tile_map: dict[str, tuple[int, int]],
+    results: dict[str, UploadStatus],
+) -> list[str]:
+    """Fill metadata for mapped assets, navigating Adobe's gallery pages."""
+    saved_names: list[str] = []
+    current_page = 0
+    for count, (img, meta) in enumerate(pairs, 1):
+        location = tile_map.get(img.name)
+        if location is None:
+            print(
+                f"  [{count}/{len(pairs)}] ✗ {img.name} — tile not found in map",
+                flush=True,
+            )
+            continue
+        page_number, tile_idx = location
+        try:
+            if page_number != current_page:
+                _go_to_tile_page(page, page_number)
+                current_page = page_number
+            page.locator(_TILE_SEL).nth(tile_idx).click()
+            page.wait_for_timeout(1_000)
+            results[img.name] = UploadStatus.UPLOADED
+            if _fill_metadata(page, img, meta):
+                saved_names.append(img.name)
+                print(f"  [{count}/{len(pairs)}] saved {img.name}", flush=True)
+            else:
+                print(
+                    f"  [{count}/{len(pairs)}] review required {img.name}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"  [{count}/{len(pairs)}] ✗ {img.name} — {exc}", flush=True)
+    return saved_names
+
+
 def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dict[str, UploadStatus]:
     """Upload all images via the hidden file input, then fill metadata tile by tile."""
     results = {img.name: UploadStatus.FAILED for img, _ in pairs}
     eligible_pairs = []
     for img, meta in pairs:
-        reason = _auto_review_reason(meta)
+        reason = _technical_review_reason(img) or _auto_review_reason(meta)
         if reason:
             print(f"  [review] Adobe skipped {img.name}: {reason}", flush=True)
             results[img.name] = UploadStatus.NEEDS_REVIEW
@@ -325,63 +481,60 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
         )
         _navigate_to_uploads(page)
 
-        pre_count = _count_tiles(page)
-        tile_map = _build_tile_map(page, 0, pre_count)
+        pre_count = _total_asset_count(page)
+        tile_map = _build_tile_map(page)
+        existing_pairs = [(img, meta) for img, meta in pairs if img.name in tile_map]
         missing_pairs = [(img, meta) for img, meta in pairs if img.name not in tile_map]
+        saved_names: list[str] = []
+
+        # Always repair/resume assets already accepted by Adobe before trying
+        # new transfers. Otherwise a disabled Upload button or a rejected file
+        # leaves accepted assets with empty metadata.
+        if existing_pairs:
+            print(
+                f"  Resuming {len(existing_pairs)} existing Adobe Stock upload(s)...",
+                flush=True,
+            )
+            saved_names.extend(
+                _fill_mapped_metadata(page, existing_pairs, tile_map, results)
+            )
 
         if missing_pairs:
-            _open_upload_modal(page)
-            # Trigger file chooser via Browse. Setting the hidden input directly
-            # does not fire Adobe's React change handler.
-            browse_btn = page.locator(
-                "button._9-Xiq_spectrum-Link, a:has-text('Browse'), "
-                "button:has-text('Browse')"
-            ).first
-            browse_btn.wait_for(state="visible", timeout=10_000)
-            with page.expect_file_chooser(timeout=10_000) as fc_info:
-                browse_btn.click()
-            fc_info.value.set_files([str(img) for img, _ in missing_pairs])
-            print(
-                f"  Uploading {len(missing_pairs)} file(s) to Adobe Stock...",
-                flush=True,
-            )
+            _go_to_tile_page(page, 1)
+            if not _upload_button_enabled(page):
+                print(
+                    f"  [review] Adobe Upload is disabled; {len(missing_pairs)} "
+                    "file(s) remain local until ready drafts are submitted or removed",
+                    flush=True,
+                )
+            else:
+                _open_upload_modal(page)
+                # Trigger file chooser via Browse. Setting the hidden input directly
+                # does not fire Adobe's React change handler.
+                browse_btn = page.locator(
+                    "button._9-Xiq_spectrum-Link, a:has-text('Browse'), "
+                    "button:has-text('Browse')"
+                ).first
+                browse_btn.wait_for(state="visible", timeout=10_000)
+                with page.expect_file_chooser(timeout=10_000) as fc_info:
+                    browse_btn.click()
+                fc_info.value.set_files([str(img) for img, _ in missing_pairs])
+                print(
+                    f"  Uploading {len(missing_pairs)} file(s) to Adobe Stock...",
+                    flush=True,
+                )
 
-            expected = pre_count + len(missing_pairs)
-            page.wait_for_function(
-                f"() => document.querySelectorAll(\"{_TILE_SEL}\").length >= {expected}",
-                timeout=600_000,
-            )
-            page.wait_for_timeout(2_000)
-            # Adobe inserts recent uploads at the front, so rebuild across the
-            # entire gallery instead of assuming new tiles were appended.
-            tile_map = _build_tile_map(page, 0, expected)
-        else:
-            print(
-                f"  Resuming {len(pairs)} existing Adobe Stock upload(s)...",
-                flush=True,
-            )
-
-        for img, _ in pairs:
-            if img.name in tile_map:
-                results[img.name] = UploadStatus.UPLOADED
-
-        # Fill metadata using the correct tile for each image
-        saved_names: list[str] = []
-        for count, (img, meta) in enumerate(pairs):
-            tile_idx = tile_map.get(img.name)
-            if tile_idx is None:
-                print(f"  [{count + 1}/{len(pairs)}] ✗ {img.name} — tile not found in map", flush=True)
-                continue
-            try:
-                page.locator(_TILE_SEL).nth(tile_idx).click()
-                page.wait_for_timeout(1_000)
-                if _fill_metadata(page, img, meta):
-                    saved_names.append(img.name)
-                    print(f"  [{count + 1}/{len(pairs)}] saved {img.name}", flush=True)
-                else:
-                    print(f"  [{count + 1}/{len(pairs)}] review required {img.name}", flush=True)
-            except Exception as e:
-                print(f"  [{count + 1}/{len(pairs)}] ✗ {img.name} — {e}", flush=True)
+                _wait_for_uploaded_tiles(page, pre_count, len(missing_pairs))
+                page.wait_for_timeout(2_000)
+                # Adobe inserts recent uploads at the front, so rebuild across
+                # every gallery page and fill only files actually accepted.
+                tile_map = _build_tile_map(page)
+                accepted_pairs = [
+                    (img, meta) for img, meta in missing_pairs if img.name in tile_map
+                ]
+                saved_names.extend(
+                    _fill_mapped_metadata(page, accepted_pairs, tile_map, results)
+                )
 
         # A global submit action may include pre-existing drafts. Leave this batch
         # saved for review unless the uploads page was empty before this run.

@@ -15,6 +15,7 @@ from metadata_core import (
     validate_metadata_quality,
     write_metadata,
 )
+from regenerate_verified_location_metadata import _pairs_for_scope
 
 
 def sample_metadata():
@@ -44,6 +45,23 @@ def sample_metadata():
 
 
 class MetadataCoreTests(unittest.TestCase):
+    def test_location_regeneration_file_scope_excludes_sibling_images(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            requested = directory / "requested.jpg"
+            sibling = directory / "sibling.jpg"
+            requested.write_bytes(b"requested")
+            sibling.write_bytes(b"sibling")
+            for image in (requested, sibling):
+                (directory / f"{image.name}.json").write_text(
+                    json.dumps({"source": image.name}), encoding="utf-8"
+                )
+
+            pairs, missing = _pairs_for_scope(directory, requested)
+
+            self.assertEqual([image.name for image, _ in pairs], ["requested.jpg"])
+            self.assertEqual(missing, [])
+
     def test_enforce_limits_deduplicates_and_normalizes(self):
         metadata = sample_metadata()
         metadata["title_en"] = "A " + ("very " * 30) + "long title"
@@ -163,6 +181,27 @@ class MetadataCoreTests(unittest.TestCase):
 
         self.assertIn("a supplied location requires a known location_source", errors)
         self.assertIn("a supplied location requires location_confidence", errors)
+
+    def test_quality_advisory_detects_verified_location_missing_from_description(self):
+        metadata = sample_metadata()
+        metadata.update(
+            {
+                "location_en": "Grand Canyon of the Yellowstone, Yellowstone National Park",
+                "location_zh": "黄石国家公园黄石大峡谷",
+                "location_source": "context",
+                "location_confidence": "high",
+            }
+        )
+        normalized = enforce_limits(metadata)
+
+        warnings = assess_metadata_quality(normalized)
+        self.assertTrue(any("Grand Canyon of the Yellowstone" in value for value in warnings))
+
+        normalized["description_en"] += (
+            " Photographed at Grand Canyon of the Yellowstone, Yellowstone National Park."
+        )
+        warnings = assess_metadata_quality(normalized)
+        self.assertFalse(any("most specific verified location" in value for value in warnings))
 
     def test_platform_defaults_do_not_misclassify_transport_as_nature(self):
         categories = default_platform_categories("Transportation", "")

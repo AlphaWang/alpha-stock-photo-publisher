@@ -62,13 +62,13 @@ class VisualFactsTests(unittest.TestCase):
         self.assertEqual(set(contract["required"]), set(VISUAL_FACT_FIELDS))
         self.assertEqual(set(contract["properties"]), set(VISUAL_FACT_FIELDS))
 
-    def test_low_commercial_potential_is_not_selected_for_persistence(self):
+    def test_full_coverage_can_record_low_commercial_potential(self):
         facts = complete_visual_facts()
         facts["commercial_potential"] = "low"
 
         issues = validate_visual_facts(facts)
 
-        self.assertTrue(any("high or medium" in issue for issue in issues))
+        self.assertEqual(issues, [])
 
     def test_grand_teton_regression_cases_are_blocked(self):
         fixture = Path(__file__).parent / "fixtures" / (
@@ -169,6 +169,49 @@ class VisualFactsTests(unittest.TestCase):
 
         self.assertEqual(set(issues), {1, 2, 3, 4})
 
+    def test_full_coverage_mode_allows_more_than_three_ranked_frames(self):
+        items = []
+        for index in range(4):
+            facts = complete_visual_facts()
+            facts["burst_group_id"] = "fox-burst-1"
+            facts["burst_rank"] = index + 1
+            items.append(
+                {
+                    "image": f"fox-{index}.jpg",
+                    "visual_facts": facts,
+                    "metadata": sample_metadata(),
+                }
+            )
+
+        issues = validate_visual_fact_batch(
+            items,
+            max_selected_per_burst=None,
+        )
+
+        self.assertEqual(issues, {})
+
+    def test_partial_full_coverage_manifest_allows_nonconsecutive_global_ranks(self):
+        items = []
+        for rank in (4, 7):
+            facts = complete_visual_facts()
+            facts["burst_group_id"] = "fox-burst-1"
+            facts["burst_rank"] = rank
+            items.append(
+                {
+                    "image": f"fox-{rank}.jpg",
+                    "visual_facts": facts,
+                    "metadata": sample_metadata(),
+                }
+            )
+
+        issues = validate_visual_fact_batch(
+            items,
+            require_complete_ranking=False,
+            max_selected_per_burst=None,
+        )
+
+        self.assertEqual(issues, {})
+
     def test_small_curated_burst_can_share_exact_factual_copy(self):
         facts_by_source = {}
         records = []
@@ -182,6 +225,25 @@ class VisualFactsTests(unittest.TestCase):
 
         issues = find_batch_quality_issues(
             records, visual_facts_by_source=facts_by_source
+        )
+
+        self.assertEqual(issues, {})
+
+    def test_full_coverage_burst_can_share_exact_factual_copy(self):
+        facts_by_source = {}
+        records = []
+        for index in range(5):
+            source = f"fox-{index}.jpg"
+            facts = complete_visual_facts()
+            facts["burst_group_id"] = "fox-burst-1"
+            facts["burst_rank"] = index + 1
+            facts_by_source[source] = facts
+            records.append((source, enforce_limits(sample_metadata())))
+
+        issues = find_batch_quality_issues(
+            records,
+            visual_facts_by_source=facts_by_source,
+            allow_full_coverage_bursts=True,
         )
 
         self.assertEqual(issues, {})

@@ -58,7 +58,7 @@
     "burst_group_id": {"type": "string"},
     "burst_rank": {"type": "integer", "minimum": 0},
     "technical_quality": {"const": "pass"},
-    "commercial_potential": {"enum": ["high", "medium"]},
+    "commercial_potential": {"enum": ["high", "medium", "low"]},
     "commercial_strengths_en": {"$ref": "#/$defs/nonEmptyStrings"},
     "selection_status": {"const": "selected"},
     "uncertain_details": {"$ref": "#/$defs/strings"}

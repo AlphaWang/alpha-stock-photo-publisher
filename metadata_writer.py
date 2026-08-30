@@ -103,6 +103,14 @@ def main() -> int:
         action="store_true",
         help="Allow repeated titles/descriptions after explicit visual review",
     )
+    parser.add_argument(
+        "--preserve-all-frames",
+        action="store_true",
+        help=(
+            "Keep every explicitly requested, technically usable frame while "
+            "still validating burst grouping and ranking"
+        ),
+    )
     args = parser.parse_args()
 
     output_dir = args.output.expanduser().resolve() if args.output else None
@@ -202,7 +210,11 @@ def main() -> int:
         print(f"Failed manifest items: {failures}", file=sys.stderr)
         return 1
 
-    fact_batch_issues = validate_visual_fact_batch(items)
+    fact_batch_issues = validate_visual_fact_batch(
+        items,
+        require_complete_ranking=not args.preserve_all_frames,
+        max_selected_per_burst=None if args.preserve_all_frames else 3,
+    )
     if fact_batch_issues:
         for index, issues in sorted(fact_batch_issues.items()):
             print(
@@ -220,6 +232,7 @@ def main() -> int:
     repeated = find_batch_quality_issues(
         [(str(image), metadata) for _, image, metadata, _facts in prepared],
         visual_facts_by_source=visual_facts_by_source,
+        allow_full_coverage_bursts=args.preserve_all_frames,
     )
     if repeated and not args.allow_repeated_metadata:
         for source, issues in sorted(repeated.items()):

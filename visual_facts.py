@@ -13,7 +13,7 @@ FACTS_SCHEMA_VERSION = 1
 OBSERVATION_STATES = {"yes", "no", "unknown"}
 SELECTION_STATES = {"selected", "review", "reject"}
 TECHNICAL_QUALITY_STATES = {"pass", "review", "reject"}
-COMMERCIAL_POTENTIAL_STATES = {"high", "medium"}
+COMMERCIAL_POTENTIAL_STATES = {"high", "medium", "low"}
 MAX_SELECTED_PER_BURST = 3
 
 VISUAL_FACT_FIELDS = (
@@ -206,7 +206,7 @@ def validate_visual_facts(value: object) -> list[str]:
         )
     if facts["commercial_potential"] not in COMMERCIAL_POTENTIAL_STATES:
         errors.append(
-            "visual_facts.commercial_potential must be high or medium"
+            "visual_facts.commercial_potential must be high, medium, or low"
         )
     if not facts["commercial_strengths_en"]:
         errors.append(
@@ -390,9 +390,12 @@ def validate_metadata_against_visual_facts(
 
 
 def validate_visual_fact_batch(
-    items: list[dict], *, require_complete_ranking: bool = True
+    items: list[dict],
+    *,
+    require_complete_ranking: bool = True,
+    max_selected_per_burst: int | None = MAX_SELECTED_PER_BURST,
 ) -> dict[int, list[str]]:
-    """Enforce explicit curation for near-identical burst frames."""
+    """Validate burst grouping, ranking, and an optional curation limit."""
     issues: dict[int, list[str]] = defaultdict(list)
     groups: dict[str, list[int]] = defaultdict(list)
     facts_by_index = {}
@@ -402,11 +405,14 @@ def validate_visual_fact_batch(
         if facts["burst_group_id"] and facts["selection_status"] == "selected":
             groups[facts["burst_group_id"]].append(index)
     for group, indexes in groups.items():
-        if len(indexes) > MAX_SELECTED_PER_BURST:
+        if (
+            max_selected_per_burst is not None
+            and len(indexes) > max_selected_per_burst
+        ):
             for index in indexes:
                 issues[index].append(
                     f"burst group {group!r} has {len(indexes)} selected frames; "
-                    f"maximum is {MAX_SELECTED_PER_BURST}"
+                    f"maximum is {max_selected_per_burst}"
                 )
         signatures = {facts_by_index[index]["scene_signature"] for index in indexes}
         if len(signatures) > 1:
@@ -448,5 +454,26 @@ def repetition_allowed_for_curated_burst(
         and "" not in groups
         and len(signatures) == 1
         and "" not in signatures
+        and all(item["selection_status"] == "selected" for item in facts)
+    )
+
+
+def repetition_allowed_for_full_coverage_burst(
+    sources: list[str], visual_facts_by_source: dict[str, dict]
+) -> bool:
+    """Allow truthful exact copy across a fully ranked same-scene burst."""
+    if len(sources) < 2:
+        return False
+    facts = [normalize_visual_facts(visual_facts_by_source.get(source)) for source in sources]
+    groups = {item["burst_group_id"] for item in facts}
+    signatures = {item["scene_signature"] for item in facts}
+    ranks = [item["burst_rank"] for item in facts]
+    return (
+        len(groups) == 1
+        and "" not in groups
+        and len(signatures) == 1
+        and "" not in signatures
+        and len(ranks) == len(set(ranks))
+        and all(rank > 0 for rank in ranks)
         and all(item["selection_status"] == "selected" for item in facts)
     )

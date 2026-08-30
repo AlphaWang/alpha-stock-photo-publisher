@@ -90,6 +90,7 @@ Optimize for commercial usefulness:
 - Be visually accurate first. Never invent objects, locations, species, demographics, landmarks, brands, events, or people that are not visible or supplied in context.
 - Ground each result in the image being processed. Never copy a scene classification from an adjacent filename or assume consecutive frames show the same subjects.
 - Distinguish shooting context from visible content. Context may establish location, but do not say a lake, river, building, person, or other subject is visible unless it is actually in the image.
+- When a medium- or high-confidence location is commercially meaningful, include its canonical name in the buyer-facing descriptions. Shutterstock receives description_en, not title_en, so never leave the destination only in title_en, keywords, or location fields. Phrase context-only landmarks as the shooting location rather than as visible content.
 - Similar burst frames may share core facts, but account for any visible change in subject, foreground, activity, structure, text, logo, or release risk.
 - First identify visible facts, then derive buyer metadata. Include subject, action, setting, composition/viewpoint, color, copy space, and commercially useful concepts only when genuinely supported. Do not infer a season, time, mood, or use case from color alone.
 - Put the most important search terms first. The first 10 English keywords should carry the core subject and buyer intent.
@@ -723,6 +724,21 @@ def assess_metadata_quality(result: dict) -> list[str]:
         warnings.append(
             "fewer than 8 Chinese keywords: add more only when they remain directly relevant"
         )
+    location_en = clean_text(result.get("location_en", ""))
+    if (
+        location_en
+        and result.get("location_confidence") in {"medium", "high"}
+    ):
+        specific_location = location_en.split(",", 1)[0].strip()
+        description_en = clean_text(result.get("description_en", ""))
+        if (
+            specific_location
+            and specific_location.casefold() not in description_en.casefold()
+        ):
+            warnings.append(
+                "description_en omits the most specific verified location: "
+                + specific_location
+            )
     return warnings
 
 
@@ -731,6 +747,7 @@ def find_batch_quality_issues(
     *,
     lead_repeat_limit: int = 5,
     visual_facts_by_source: dict[str, dict] | None = None,
+    allow_full_coverage_bursts: bool = False,
 ) -> dict[str, list[str]]:
     """Find repeated metadata that can hide scene-boundary classification errors."""
     issues: dict[str, list[str]] = defaultdict(list)
@@ -757,11 +774,22 @@ def find_batch_quality_issues(
             if visual_facts_by_source:
                 # Local import avoids making the base metadata contract depend on
                 # visual-review tooling for legacy/manual workflows.
-                from visual_facts import repetition_allowed_for_curated_burst
+                from visual_facts import (
+                    repetition_allowed_for_curated_burst,
+                    repetition_allowed_for_full_coverage_burst,
+                )
 
-                if repetition_allowed_for_curated_burst(
+                repetition_allowed = repetition_allowed_for_curated_burst(
                     sources, visual_facts_by_source
-                ):
+                )
+                if allow_full_coverage_bursts:
+                    repetition_allowed = (
+                        repetition_allowed
+                        or repetition_allowed_for_full_coverage_burst(
+                            sources, visual_facts_by_source
+                        )
+                    )
+                if repetition_allowed:
                     continue
             message = f"duplicate {field} shared by {len(sources)} images"
             for source in sources:
@@ -770,6 +798,13 @@ def find_batch_quality_issues(
     for sources in lead_groups.values():
         if len(sources) <= lead_repeat_limit:
             continue
+        if visual_facts_by_source and allow_full_coverage_bursts:
+            from visual_facts import repetition_allowed_for_full_coverage_burst
+
+            if repetition_allowed_for_full_coverage_burst(
+                sources, visual_facts_by_source
+            ):
+                continue
         message = (
             "description_en factual lead is repeated across "
             f"{len(sources)} images (limit {lead_repeat_limit})"
@@ -795,6 +830,8 @@ def write_metadata(
     visual_review_status: str = "unreviewed",
     visual_review_method: str = "",
     visual_facts: dict | None = None,
+    source_sha256: str | None = None,
+    source_size: int | None = None,
 ) -> Path:
     """Normalize, validate, and write one timestamped metadata JSON file."""
     normalized = enforce_limits(result)
@@ -822,8 +859,8 @@ def write_metadata(
     out_file = output_dir / f"{image_path.name}_{timestamp}.json"
     payload = {
         "source": image_path.name,
-        "source_sha256": image_sha256(image_path),
-        "source_size": image_path.stat().st_size,
+        "source_sha256": source_sha256 or image_sha256(image_path),
+        "source_size": source_size if source_size is not None else image_path.stat().st_size,
         "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
         "visual_review_status": visual_review_status,
         "visual_review_method": visual_review_method,

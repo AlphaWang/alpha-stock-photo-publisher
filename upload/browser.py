@@ -107,9 +107,10 @@ def ensure_logged_in(
         print(f"Browser opened. Please log in at: {login_url}", flush=True)
         try:
             page.goto(login_url, wait_until="commit", timeout=30_000)
-        except PlaywrightTimeout:
-            # Some contributor portals never finish the load event. Once
-            # navigation has started, keep the browser open for manual login.
+        except (PlaywrightTimeout, PlaywrightError):
+            # Some contributor portals never finish the load event or abort the
+            # original request while redirecting. Keep the browser open for
+            # manual login; the explicit session check below remains authoritative.
             pass
         if prepare_login is not None:
             prepare_login()

@@ -805,6 +805,18 @@ class UploadLogicTests(unittest.TestCase):
         )
         self.assertTrue(px500_module._context_has_logged_in_session(context))
 
+    def test_500px_empty_creator_response_falls_back_to_login(self):
+        class Page:
+            url = "about:blank"
+
+            def goto(self, url, **kwargs):
+                raise px500_module.PWError("net::ERR_EMPTY_RESPONSE")
+
+            def wait_for_selector(self, selector, timeout):
+                raise px500_module.PWTimeout("not loaded")
+
+        self.assertFalse(px500_module._is_logged_in(Page()))
+
     def test_500px_sets_files_on_active_photo_input(self):
         selected = []
 
@@ -1220,6 +1232,30 @@ class UploadLogicTests(unittest.TestCase):
 
             def goto(self, url, **kwargs):
                 raise browser_module.PlaywrightTimeout("slow login page")
+
+            def wait_for_timeout(self, timeout):
+                self.waits += 1
+
+        page = Page()
+        poll_results = iter([False, True])
+
+        with patch("builtins.input", side_effect=EOFError):
+            browser_module.ensure_logged_in(
+                page,
+                lambda: False,
+                "https://example.com/login",
+                poll_logged_in=lambda: next(poll_results),
+            )
+
+        self.assertEqual(page.waits, 2)
+
+    def test_login_navigation_redirect_abort_keeps_waiting_for_user(self):
+        class Page:
+            def __init__(self):
+                self.waits = 0
+
+            def goto(self, url, **kwargs):
+                raise browser_module.PlaywrightError("navigation redirected")
 
             def wait_for_timeout(self, timeout):
                 self.waits += 1

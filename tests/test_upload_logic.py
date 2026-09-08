@@ -58,6 +58,7 @@ from upload.shutterstock import (
 )
 from upload.tuchong import _login_page_session_ready as tuchong_login_ready
 from upload.tuchong import _card_error as tuchong_card_error
+from upload.tuchong import _retryable_card_error as tuchong_retryable_error
 from upload.tuchong import _saved_draft_status as tuchong_saved_draft_status
 from upload.tuchong import _categories_for_metadata as tuchong_categories
 from upload.tuchong import _upload_status_is_pending as tuchong_upload_pending
@@ -1280,6 +1281,12 @@ class UploadLogicTests(unittest.TestCase):
                 return "上传中 100%"
 
         self.assertEqual(tuchong_card_error(Page(), "photo.jpg"), "上传中 100%")
+
+    def test_tuchong_retries_transient_upload_card_errors(self):
+        self.assertTrue(tuchong_retryable_error("Upload card not found"))
+        self.assertTrue(tuchong_retryable_error("上传中 6%"))
+        self.assertTrue(tuchong_retryable_error("Network Error"))
+        self.assertFalse(tuchong_retryable_error("图片信息不符要求"))
 
     def test_tuchong_incomplete_metadata_remains_resumable(self):
         status = tuchong_saved_draft_status("photo.jpg", set(), set())

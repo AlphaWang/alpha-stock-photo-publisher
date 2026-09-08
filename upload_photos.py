@@ -196,7 +196,9 @@ def _validate_metadata_binding(
 _BATCH_LIMIT = {
     "shutterstock": 100,
     "px500":        100,
-    "tuchong":        3,
+    # Persist each Tuchong image before starting the next one so a later
+    # transfer failure cannot roll back completed work.
+    "tuchong":        1,
     "adobestock":    50,
     "istock":        50,
 }

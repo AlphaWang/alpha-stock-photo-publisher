@@ -206,7 +206,7 @@ def _fill_metadata(page: Page, metadata: dict) -> _MetadataFillResult:
         if selected_categories == 0:
             fields_verified = False
             print("  [warn] no image category could be selected")
-    except PWTimeout as e:
+    except Exception as e:
         print(f"  [warn] category field failed: {e}")
         fields_verified = False
         page.keyboard.press("Escape")
@@ -382,20 +382,40 @@ def _wait_for_uploads(page: Page, count: int) -> None:
     except PWTimeout:
         return
 
-    deadline_ms = max(180_000, count * 2 * 60 * 1000)
+    # Large panoramas can take well over three minutes on the contributor CDN.
+    # Progress-based stall detection remains the primary failure guard.
+    deadline_ms = max(2 * 60 * 60 * 1000, count * 2 * 60 * 1000)
     elapsed_ms = 0
     check_ms = 10_000
+    stalled_ms = 0
+    last_statuses: tuple[str, ...] | None = None
     while elapsed_ms < deadline_ms:
         statuses = page.evaluate(
-            """() => [...document.querySelectorAll(
-                '.contribute__image__item .upload-process-each__text'
-            )].map(el => el.textContent.trim())"""
+            """() => [...document.querySelectorAll('.contribute__image__item')]
+                .map(card => {
+                    const elements = [...card.querySelectorAll('.upload-process-each__text')];
+                    const visible = elements.find(el => {
+                        const style = getComputedStyle(el);
+                        return style.display !== 'none' && style.visibility !== 'hidden';
+                    });
+                    const el = visible || elements[0];
+                    return el ? el.textContent.trim() : '';
+                })"""
         )
         # Tuchong keeps the form disabled while a card says either
         # "等待上传中" or "上传中 100%".  The latter means transfer reached
         # 100%, not that server-side processing and form initialization ended.
         pending = sum(1 for status in statuses if _upload_status_is_pending(status))
         if pending == 0:
+            break
+        current_statuses = tuple(statuses)
+        if current_statuses == last_statuses:
+            stalled_ms += check_ms
+        else:
+            stalled_ms = 0
+            last_statuses = current_statuses
+        if stalled_ms >= 120_000:
+            print("  [warn] upload made no progress for 120s; retrying", flush=True)
             break
         status_summary = ", ".join(dict.fromkeys(statuses))
         print(f"  [wait] {pending}/{count} queued/processing: {status_summary}", flush=True)
@@ -411,9 +431,18 @@ def _card_error(page: Page, filename: str) -> Optional[str]:
     status = page.evaluate(
         """(filename) => {
             const cards = [...document.querySelectorAll('.contribute__image__item')];
-            const card = cards.find(c => c.innerText.includes(filename));
-            if (!card) return 'upload card not found';
-            const el = card.querySelector('.upload-process-each__text');
+            const stem = filename.replace(/\\.[^.]+$/, '');
+            const matches = card => card.innerText.split('\\n').some(line => {
+                const text = line.trim().replace(/^\\d+\\.\\s*/, '');
+                return text === filename || text === stem;
+            });
+            const card = cards.find(matches);
+            if (!card) return 'Upload card not found';
+            const elements = [...card.querySelectorAll('.upload-process-each__text')];
+            const el = elements.find(candidate => {
+                const style = getComputedStyle(candidate);
+                return style.display !== 'none' && style.visibility !== 'hidden';
+            }) || elements[0];
             if (!el) return null;
             return el.textContent.trim() || null;
         }""",
@@ -423,6 +452,18 @@ def _card_error(page: Page, filename: str) -> Optional[str]:
     # Successful cards remove the status element; other non-empty labels are
     # platform errors and should also remain retryable/reviewable.
     return status or None
+
+
+def _retryable_card_error(error: str) -> bool:
+    return any(
+        marker in error
+        for marker in (
+            "Network Error",
+            "等待上传中",
+            "上传中",
+            "Upload card not found",
+        )
+    )
 
 
 def _saved_draft_status(
@@ -488,7 +529,7 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
         }""")
         page.reload(wait_until="domcontentloaded", timeout=20_000)
 
-        # --- Upload phase with Network Error retry (up to 3 rounds) ---
+        # --- Upload phase with clean-page retry (up to 3 rounds) ---
         to_upload = list(pairs)
         ok_pairs: list[tuple[Path, dict]] = []
 
@@ -504,28 +545,54 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
             if upload_round == 0:
                 print(f"  Uploading {total} image(s) to Tuchong...", flush=True)
             else:
-                print(f"  Retrying {len(to_upload)} image(s) after Network Error...", flush=True)
+                print(
+                    f"  Retrying {len(to_upload)} image(s) on a clean page "
+                    f"({upload_round + 1}/3)...",
+                    flush=True,
+                )
 
             _wait_for_uploads(page, len(to_upload))
 
-            # Inspect each card; delete Network Error ones and queue for retry
+            # A missing or still-processing card can be a transient contributor
+            # UI failure, so retry it along with explicit network errors.
             retry: list[tuple[Path, dict]] = []
             for img, metadata in to_upload:
                 err = _card_error(page, img.name)
                 if err is None:
                     ok_pairs.append((img, metadata))
-                elif "Network Error" in err:
-                    _delete_card(page, img.name)
+                elif _retryable_card_error(err):
                     retry.append((img, metadata))
                 else:
                     print(f"  [skip] {img.name}: {err}", flush=True)
 
             to_upload = retry
             if retry and upload_round < 2:
-                page.wait_for_timeout(2_000)
+                page.close()
+                page = context.new_page()
+                for navigation_attempt in range(3):
+                    try:
+                        page.goto(
+                            UPLOAD_URL,
+                            wait_until="domcontentloaded",
+                            timeout=20_000,
+                        )
+                        break
+                    except PWTimeout:
+                        if navigation_attempt == 2:
+                            raise
+                        page.wait_for_timeout(2_000)
+                page.evaluate("""() => {
+                    try { localStorage.clear(); } catch(e) {}
+                    if (navigator.serviceWorker) {
+                        navigator.serviceWorker.getRegistrations().then(regs =>
+                            regs.forEach(r => r.unregister())
+                        );
+                    }
+                }""")
+                page.reload(wait_until="domcontentloaded", timeout=20_000)
 
         for img, _ in to_upload:
-            print(f"  [fail] {img.name}: Network Error after 3 attempts", flush=True)
+            print(f"  [fail] {img.name}: upload incomplete after 3 attempts", flush=True)
 
         for img, _ in ok_pairs:
             results[img.name] = UploadStatus.UPLOADED

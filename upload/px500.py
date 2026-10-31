@@ -16,7 +16,12 @@ from typing import Optional
 from urllib.parse import urlsplit
 
 from PIL import Image
-from playwright.sync_api import BrowserContext, Page, TimeoutError as PWTimeout
+from playwright.sync_api import (
+    BrowserContext,
+    Error as PWError,
+    Page,
+    TimeoutError as PWTimeout,
+)
 
 from .browser import ensure_logged_in
 from .confirmation import wait_for_success_text
@@ -58,7 +63,9 @@ def _context_has_logged_in_session(context: BrowserContext) -> bool:
 def _is_logged_in(page: Page) -> bool:
     try:
         page.goto(UPLOAD_URL, wait_until="commit", timeout=30_000)
-    except PWTimeout:
+    except (PWTimeout, PWError):
+        # The creator portal intermittently aborts or returns an empty response.
+        # Treat that as "not logged in" so the manual login/bridge flow can run.
         pass
     try:
         page.wait_for_selector("button.button_cmp_main", timeout=10_000)

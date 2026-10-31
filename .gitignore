@@ -5,3 +5,5 @@ __pycache__/
 .claude/settings.local.json
 .idea/
 .stock_upload_history.json
+.tmp/
+.venv/

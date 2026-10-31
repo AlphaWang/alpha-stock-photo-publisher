@@ -563,6 +563,11 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
                 elif _retryable_card_error(err):
                     retry.append((img, metadata))
                 else:
+                    # Tuchong rejects a filename that already exists in the
+                    # contributor drafts. Treat that as an idempotent success
+                    # so interrupted runs do not keep attempting the same file.
+                    if "要添加内容已存在" in err:
+                        results[img.name] = UploadStatus.DRAFT_SAVED
                     print(f"  [skip] {img.name}: {err}", flush=True)
 
             to_upload = retry

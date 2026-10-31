@@ -92,6 +92,23 @@ def _auto_review_reason(meta: dict) -> str:
     return ""
 
 
+def _release_declaration(meta: dict) -> Optional[str]:
+    """Answer Adobe's required question only when verified evidence is decisive."""
+    facts = meta.get("visual_facts") or {}
+    if (
+        facts.get("recognizable_people_visible") == "no"
+        and facts.get("private_property_visible") == "no"
+        and meta.get("model_release_status") == "not_required"
+        and meta.get("property_release_status") == "not_required"
+        and meta.get("logo_trademark_status") == "none"
+        and meta.get("copyrighted_content_status") == "none"
+    ):
+        return "No"
+    # A "Yes" answer also needs the matching release attached in Adobe.
+    # The uploader does not perform that attachment, so leave it for review.
+    return None
+
+
 def _technical_review_reason(image_path: Path) -> str:
     """Return an Adobe photo-spec violation that requires manual preparation."""
     try:
@@ -265,7 +282,10 @@ def _build_current_page_tile_map(page: Page, page_number: int) -> dict[str, tupl
     tiles = page.locator(_TILE_SEL)
     for idx in range(tiles.count()):
         try:
-            tiles.nth(idx).click()
+            # Adobe's hover Quickview image can intermittently cover the tile
+            # while the pointer is moving. The tile itself remains the intended
+            # selection target, so bypass pointer interception.
+            tiles.nth(idx).click(force=True)
             page.wait_for_timeout(250)
             footer = page.locator("[data-t='asset-sidebar-footer']").inner_text(timeout=3_000)
             filename = _extract_original_filename(footer)
@@ -336,13 +356,23 @@ def _fill_metadata(page: Page, img: Path, meta: dict) -> bool:
         print(f"  [warn] {img.name}: title textarea not found")
         return False
 
-    # "Recognizable people or property?" — required before Save is enabled; click "No" switch
+    # Never infer "No" from a generic commercial status or an absent release.
+    # Unknown visual evidence must remain for contributor review.
+    declaration = _release_declaration(meta)
+    if declaration is None:
+        print(f"  [review] {img.name}: Adobe people/property declaration needs review")
+        return False
     try:
-        no_switch = page.locator("label:has([data-t='has-release-no']) span.switch__body").first
-        if no_switch.count() == 0:
+        control = page.get_by_role("button", name=declaration, exact=True).first
+        if control.count() == 0:
+            suffix = declaration.lower()
+            control = page.locator(
+                f"label:has([data-t='has-release-{suffix}']) span.switch__body"
+            ).first
+        if control.count() == 0:
             print(f"  [warn] {img.name}: release declaration control not found")
             return False
-        no_switch.click()
+        control.click()
         page.wait_for_timeout(200)
     except Exception as e:
         print(f"  [warn] {img.name}: release declaration failed — {e}")
@@ -426,7 +456,15 @@ def _fill_mapped_metadata(
     """Fill metadata for mapped assets, navigating Adobe's gallery pages."""
     saved_names: list[str] = []
     current_page = 0
-    for count, (img, meta) in enumerate(pairs, 1):
+    # Saving a draft can remove it from the current filtered gallery without
+    # replenishing the visible page. Process high indexes first so removal does
+    # not invalidate the positions of assets still waiting on that page.
+    ordered_pairs = sorted(
+        pairs,
+        key=lambda pair: tile_map.get(pair[0].name, (0, -1)),
+        reverse=True,
+    )
+    for count, (img, meta) in enumerate(ordered_pairs, 1):
         location = tile_map.get(img.name)
         if location is None:
             print(
@@ -439,7 +477,7 @@ def _fill_mapped_metadata(
             if page_number != current_page:
                 _go_to_tile_page(page, page_number)
                 current_page = page_number
-            page.locator(_TILE_SEL).nth(tile_idx).click()
+            page.locator(_TILE_SEL).nth(tile_idx).click(force=True)
             page.wait_for_timeout(1_000)
             results[img.name] = UploadStatus.UPLOADED
             if _fill_metadata(page, img, meta):
@@ -455,8 +493,13 @@ def _fill_mapped_metadata(
     return saved_names
 
 
-def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dict[str, UploadStatus]:
-    """Upload all images via the hidden file input, then fill metadata tile by tile."""
+def upload_batch(
+    pairs: list[tuple[Path, dict]],
+    context: BrowserContext,
+    *,
+    repair_existing_only: bool = False,
+) -> dict[str, UploadStatus]:
+    """Upload images or repair metadata on matching existing Adobe drafts."""
     results = {img.name: UploadStatus.FAILED for img, _ in pairs}
     eligible_pairs = []
     for img, meta in pairs:
@@ -498,6 +541,16 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
             saved_names.extend(
                 _fill_mapped_metadata(page, existing_pairs, tile_map, results)
             )
+
+        if repair_existing_only and missing_pairs:
+            for img, _ in missing_pairs:
+                results[img.name] = UploadStatus.NEEDS_REVIEW
+            print(
+                f"  [review] Adobe draft repair skipped {len(missing_pairs)} "
+                "file(s) not present in the current draft box",
+                flush=True,
+            )
+            missing_pairs = []
 
         if missing_pairs:
             _go_to_tile_page(page, 1)

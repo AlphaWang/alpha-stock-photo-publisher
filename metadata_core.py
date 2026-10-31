@@ -144,7 +144,7 @@ Return strict JSON with no markdown fences and exactly these fields. Use an empt
   "location_zh": "Reliable city-level location or empty string",
   "location_source": "unknown, context, exif, manual, or visible_landmark",
   "location_confidence": "unknown, low, medium, or high",
-  "core_keywords_zh": ["up to five objective terms from keywords_zh"],
+  "core_keywords_zh": ["one to five most distinctive search terms selected from keywords_zh; prioritize the exact visible subject and a verified location when useful"],
   "commercial_uses_en": ["up to five realistic buyer use cases"],
   "editorial_caption_en": "LOCATION - D Month YYYY: factual visible description, or empty string",
   "editorial_date": "YYYY-MM-DD supported by evidence, or empty string",
@@ -371,8 +371,6 @@ def enforce_limits(result: dict) -> dict:
     normalized["core_keywords_zh"] = normalize_keywords(
         normalized.get("core_keywords_zh", []), limit=0
     )
-    if not normalized["core_keywords_zh"]:
-        normalized["core_keywords_zh"] = normalized["keywords_zh"][:5]
 
     category1 = clean_text(normalized.get("category1", ""))
     category2 = clean_text(normalized.get("category2", ""))
@@ -574,6 +572,8 @@ def validate_metadata(result: dict) -> list[str]:
         errors.append(f"keywords_zh exceeds {PX500_KW_MAX} keywords")
     if len(result.get("core_keywords_zh", [])) > 5:
         errors.append("core_keywords_zh exceeds 5 keywords")
+    if not result.get("core_keywords_zh"):
+        errors.append("core_keywords_zh must contain 1 to 5 selected keywords")
     if len(result.get("commercial_uses_en", [])) > 5:
         errors.append("commercial_uses_en exceeds 5 values")
     editorial_date = result.get("editorial_date", "")

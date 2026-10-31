@@ -468,11 +468,17 @@ def _wait_for_resubmitted_asset(
 
 
 def _fill_metadata(page, img: Path, meta: dict, *, correction: bool = False) -> bool:
-    """Fill description, keywords, and categories for the currently open edit panel."""
+    """Fill safe draft metadata, even when a release still needs review."""
     usage, review_reason = _submission_mode(meta)
-    if review_reason:
+    if correction and review_reason:
         print(f"  [review] {img.name}: {review_reason}")
         return False
+    if review_reason:
+        print(
+            f"  [review] {img.name}: {review_reason}; saving factual draft "
+            "metadata without marking it ready",
+            flush=True,
+        )
     # Wait for the panel to show THIS image's title before filling anything.
     # Without this, a React re-render caused by the card transition can clear
     # a description we already filled.
@@ -506,7 +512,7 @@ def _fill_metadata(page, img: Path, meta: dict, *, correction: bool = False) -> 
 
     _replace_keywords(page, meta.get("keywords_en", []))
 
-    if not _set_usage(page, usage):
+    if usage is not None and not _set_usage(page, usage):
         print(f"  [review] {img.name}: Shutterstock usage was not set to {usage}")
         return False
 
@@ -554,7 +560,7 @@ def _fill_metadata(page, img: Path, meta: dict, *, correction: bool = False) -> 
                 flush=True,
             )
             return False
-        if not response_ready:
+        if not response_ready and not review_reason:
             print(
                 f"  [review] {img.name}: Shutterstock validation did not mark "
                 f"the asset ready: {validation_payload!r}",
@@ -567,7 +573,7 @@ def _fill_metadata(page, img: Path, meta: dict, *, correction: bool = False) -> 
         # The returned-asset card is authoritative and changes to Resubmitted.
         return _wait_for_resubmitted_asset(page, img.name)
 
-    if save_response is not None:
+    if save_response is not None and not review_reason:
         return True
 
     page.wait_for_timeout(1_200)
@@ -592,7 +598,7 @@ def _fill_metadata(page, img: Path, meta: dict, *, correction: bool = False) -> 
         desc_area.input_value() == desc_text
         and categories_match
         and keyword_count >= 7
-        and validation_error == 0
+        and (review_reason or validation_error == 0)
     ):
         return True
 
@@ -751,8 +757,19 @@ def upload_batch(
 
                         if not _fill_metadata(page, img, meta):
                             raise RuntimeError("save was not confirmed")
-                        print(f"  ✓ Shutterstock draft saved: {img.name}")
-                        results[img.name] = UploadStatus.DRAFT_SAVED
+                        _usage, review_reason = _submission_mode(meta)
+                        if review_reason:
+                            print(
+                                f"  ✓ Shutterstock draft metadata saved; "
+                                f"needs review: {img.name} — {review_reason}",
+                                flush=True,
+                            )
+                            results[img.name] = (
+                                UploadStatus.DRAFT_SAVED_NEEDS_REVIEW
+                            )
+                        else:
+                            print(f"  ✓ Shutterstock draft saved: {img.name}")
+                            results[img.name] = UploadStatus.DRAFT_SAVED
                         break
                     except AmbiguousAssetCardError as error:
                         print(f"  [review] Shutterstock {img.name}: {error}", flush=True)

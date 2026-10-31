@@ -92,6 +92,18 @@ class MetadataCoreTests(unittest.TestCase):
         self.assertIn("title_en is required", errors)
         self.assertIn("keywords_en must contain at least 7 unique keywords", errors)
 
+    def test_core_keywords_require_an_explicit_selection(self):
+        metadata = sample_metadata()
+        metadata["core_keywords_zh"] = []
+
+        normalized = enforce_limits(metadata)
+
+        self.assertEqual(normalized["core_keywords_zh"], [])
+        self.assertIn(
+            "core_keywords_zh must contain 1 to 5 selected keywords",
+            validate_metadata(normalized),
+        )
+
     def test_invalid_categories_are_not_silently_replaced(self):
         metadata = sample_metadata()
         metadata["category1"] = "Travel"

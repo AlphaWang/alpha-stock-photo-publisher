@@ -72,6 +72,12 @@ def _community_session_ready(page: Page) -> bool:
     if _has_logged_in_session(page):
         return True
     url = page.url.lower()
+    # A successful login redirects to the community page before its client-side
+    # navigation renders.  The page can remain visually blank when optional
+    # assets are slow or blocked, but the authenticated redirect is sufficient
+    # to continue through the contributor bridge.
+    if url.startswith("https://500px.com.cn/community/"):
+        return True
     return (
         url.startswith("https://500px.com.cn/")
         and "/user/login" not in url
@@ -158,6 +164,7 @@ _LOCATION_PATHS: list[tuple[list[str], list[str]]] = [
     (["加利福尼亚", "加州", "California"], ["美国", "加利福尼亚", "其他"]),
     (["盐湖城", "Salt Lake City", "SLC"], ["美国", "犹他", "其他"]),
     (["邦纳维尔", "Bonneville"], ["美国", "犹他", "其他"]),
+    (["爱达荷", "Idaho"], ["美国", "爱达荷", "其他"]),
     (["怀俄明", "大提顿", "Grand Teton", "Wyoming"], ["美国", "怀俄明", "其他"]),
     (["纽约", "New York"], ["美国", "纽约", "纽约"]),
     (["西雅图", "Seattle"], ["美国", "华盛顿", "西雅图"]),
@@ -189,6 +196,17 @@ def _auto_review_reason(metadata: dict) -> str:
     if metadata.get("location_confidence", "unknown") not in {"medium", "high"}:
         return "shooting location confidence is too low for automatic selection"
     return ""
+
+
+def _saved_draft_status(metadata: dict, site_pending: bool) -> UploadStatus:
+    """A saved draft can still need rights or submission-mode review."""
+    if (
+        site_pending
+        or metadata.get("commercial_eligibility") != "clear"
+        or metadata.get("release_status") != "clear"
+    ):
+        return UploadStatus.DRAFT_SAVED_NEEDS_REVIEW
+    return UploadStatus.DRAFT_SAVED
 
 
 def _resolution_review_reason(width: int, height: int) -> str:
@@ -360,6 +378,38 @@ def _fill_location(page: Page, location_zh: str) -> bool:
     return bool(path and _navigate_cascader(page, path))
 
 
+def _mark_core_keywords(page: Page, keywords: list[str], core_keywords: list[str]) -> bool:
+    """Star the selected 500px keywords; never silently skip a missing control."""
+    if not 1 <= len(core_keywords) <= 5 or not set(core_keywords).issubset(keywords):
+        return False
+
+    desired = set(core_keywords)
+    seen = set()
+    # The current Creator Studio renders each selected keyword as an Ant tag
+    # containing a one-star rating control. aria-checked is the saved visual
+    # state; the close icon in the same tag must never be clicked instead.
+    tags = page.locator("span.ant-tag:has(ul.ant-rate)")
+    for tag in tags.all():
+        keyword = tag.inner_text().strip()
+        if keyword not in keywords or keyword in seen:
+            return False
+        seen.add(keyword)
+        star = tag.locator("[role='radio']")
+        if star.count() != 1:
+            return False
+        want_active = keyword in desired
+        is_active = star.first.get_attribute("aria-checked") == "true"
+        if is_active != want_active:
+            try:
+                star.first.click(timeout=3_000)
+            except PWTimeout:
+                return False
+            page.wait_for_timeout(200)
+            if (star.first.get_attribute("aria-checked") == "true") != want_active:
+                return False
+    return seen == set(keywords)
+
+
 def _fill_metadata(page: Page, metadata: dict) -> bool:
     """Fill and save one draft, returning False when manual review is required."""
     # Dismiss any info popup
@@ -418,15 +468,10 @@ def _fill_metadata(page: Page, metadata: dict) -> bool:
             kw_input.press("Enter")
             page.wait_for_timeout(800)
 
-    # Mark core keywords with star (non-fatal: star UI may not be present)
-    core_kws = metadata.get("core_keywords_zh", [])[:5]
-    for kw in core_kws:
-        try:
-            star_sel = f"span.ant-tag:has-text('{kw}') svg, span.ant-tag:has-text('{kw}') [class*='star']"
-            page.locator(star_sel).first.click(timeout=3_000)
-            page.wait_for_timeout(200)
-        except PWTimeout:
-            pass
+    core_kws = metadata.get("core_keywords_zh", [])
+    if not _mark_core_keywords(page, keywords, core_kws):
+        print("  [review] 500px core keyword stars could not be verified", flush=True)
+        return False
 
     # Location — required field; try quick buttons then cascader search
     if not _fill_location(page, location):
@@ -502,7 +547,11 @@ def _wait_for_batch_ready(
             if resume_link.count() > 0:
                 try:
                     with page.expect_file_chooser(timeout=5_000) as chooser_info:
-                        resume_link.first.click()
+                        # The draft detail overlay can remain mounted while the
+                        # interrupted card is actionable. Dispatch the click to
+                        # the link so the file chooser is not blocked by that
+                        # transparent mask.
+                        resume_link.first.click(force=True)
                     chooser_info.value.set_files(str(image))
                     resumed = True
                 except PWTimeout:
@@ -565,6 +614,50 @@ def _wait_for_batch_ready(
     raise PWTimeout("500px uploads did not become ready before timeout")
 
 
+def resume_draft_batch(
+    pairs: list[tuple[Path, dict]],
+    context: BrowserContext,
+    draft_url: str,
+    *,
+    wait_for_uploads: bool = True,
+) -> dict[str, UploadStatus]:
+    """Finish metadata for files already present in a persisted draft batch."""
+    results = {img.name: UploadStatus.FAILED for img, _ in pairs}
+    page = context.new_page()
+    try:
+        page.goto(draft_url, wait_until="commit", timeout=30_000)
+        page.wait_for_url("**/draft/detail/**", timeout=60_000)
+        page.wait_for_selector("div.card", timeout=60_000)
+
+        present_pairs = []
+        for img, metadata in pairs:
+            filename = json.dumps(img.name, ensure_ascii=False)
+            if page.locator(f"span[title={filename}]").count() > 0:
+                present_pairs.append((img, metadata))
+        if not present_pairs:
+            return results
+
+        if wait_for_uploads:
+            _wait_for_batch_ready(page, present_pairs)
+        total = len(present_pairs)
+        for index, (img, metadata) in enumerate(present_pairs, start=1):
+            filename = json.dumps(img.name, ensure_ascii=False)
+            page.locator(f"span[title={filename}]").click(force=True)
+            page.wait_for_timeout(600)
+            if _fill_metadata(page, metadata):
+                card = page.locator(f"div.card:has(span[title={filename}])")
+                site_pending = card.locator(".cannotWarnSubmit").count() > 0
+                status = _saved_draft_status(metadata, site_pending)
+                print(f"  [{index}/{total}] resumed {img.name}: {status.value}", flush=True)
+                results[img.name] = status
+            else:
+                print(f"  [{index}/{total}] review required {img.name}", flush=True)
+                results[img.name] = UploadStatus.NEEDS_REVIEW
+    finally:
+        page.close()
+    return results
+
+
 def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dict[str, UploadStatus]:
     """Upload all images in one file-chooser call, then fill metadata per draft page."""
     results = {img.name: UploadStatus.FAILED for img, _ in pairs}
@@ -612,11 +705,9 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
         for img, _ in pairs:
             results[img.name] = UploadStatus.UPLOADED
 
-        # Clear pre-selection: select all → deselect all → exit multi-select if active
-        page.locator("text=全选").first.click()
-        page.wait_for_timeout(300)
-        page.locator("text=取消全选").first.click()
-        page.wait_for_timeout(300)
+        # Keep the editor in its default single-selection mode. Toggling
+        # select-all causes the current Creator Studio to place a detail mask
+        # over the controls; the following deselect click is then intercepted.
         multisel_chk = page.locator("label:has-text('多选') input[type='checkbox']")
         if multisel_chk.count() > 0 and multisel_chk.first.is_checked():
             page.locator("text=多选").first.click()
@@ -627,8 +718,11 @@ def upload_batch(pairs: list[tuple[Path, dict]], context: BrowserContext) -> dic
             page.locator(f"span[title={filename}]").click()
             page.wait_for_timeout(600)
             if _fill_metadata(page, metadata):
-                print(f"  [{i + 1}/{total}] saved {img.name}")
-                results[img.name] = UploadStatus.DRAFT_SAVED
+                card = page.locator(f"div.card:has(span[title={filename}])")
+                site_pending = card.locator(".cannotWarnSubmit").count() > 0
+                status = _saved_draft_status(metadata, site_pending)
+                print(f"  [{i + 1}/{total}] saved {img.name}: {status.value}")
+                results[img.name] = status
             else:
                 print(f"  [{i + 1}/{total}] review required {img.name}")
 

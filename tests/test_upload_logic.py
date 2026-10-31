@@ -23,6 +23,7 @@ from upload.adobestock import _auto_review_reason as adobe_review_reason
 from upload.adobestock import _extract_original_filename as adobe_original_filename
 from upload.adobestock import _has_logged_in_session as adobe_session_ready
 from upload.adobestock import _resolve_category as resolve_adobe_category
+from upload.adobestock import _release_declaration as adobe_release_declaration
 from upload.adobestock import _technical_review_reason as adobe_technical_review_reason
 from upload.adobestock import _total_asset_count as adobe_total_asset_count
 from upload.adobestock import _wait_for_uploaded_tiles as adobe_wait_for_tiles
@@ -111,6 +112,27 @@ def complete_bound_metadata(image, *, include_hash=True, verified=True):
 
 
 class UploadLogicTests(unittest.TestCase):
+    def test_adobe_release_answer_requires_verified_clear_evidence(self):
+        clear = {
+            "visual_facts": {
+                "recognizable_people_visible": "no",
+                "private_property_visible": "no",
+            },
+            "model_release_status": "not_required",
+            "property_release_status": "not_required",
+            "logo_trademark_status": "none",
+            "copyrighted_content_status": "none",
+        }
+        self.assertEqual(adobe_release_declaration(clear), "No")
+        self.assertIsNone(adobe_release_declaration({**clear, "visual_facts": {}}))
+        self.assertIsNone(adobe_release_declaration({
+            **clear,
+            "visual_facts": {**clear["visual_facts"], "recognizable_people_visible": "unknown"},
+        }))
+        self.assertIsNone(adobe_release_declaration({
+            **clear,
+            "property_release_status": "unknown",
+        }))
     def test_full_coverage_inventory_detects_every_image_without_metadata(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             directory = Path(temp_dir)
@@ -173,6 +195,29 @@ class UploadLogicTests(unittest.TestCase):
         self.assertFalse(px500_save_confirmed(False, 0, "标题", "标题"))
         self.assertFalse(px500_save_confirmed(True, 1, "标题", "标题"))
         self.assertFalse(px500_save_confirmed(True, 0, "", "标题"))
+
+    def test_500px_missing_core_star_needs_review(self):
+        page = Mock()
+        page.locator.return_value.all.return_value = []
+
+        self.assertFalse(
+            px500_module._mark_core_keywords(page, ["直升机", "旧金山"], ["直升机"])
+        )
+
+    def test_500px_saved_draft_still_reports_rights_review(self):
+        clear = {"commercial_eligibility": "clear", "release_status": "clear"}
+        editorial = {"commercial_eligibility": "editorial_only", "release_status": "required"}
+        self.assertEqual(
+            px500_module._saved_draft_status(clear, False), UploadStatus.DRAFT_SAVED
+        )
+        self.assertEqual(
+            px500_module._saved_draft_status(clear, True),
+            UploadStatus.DRAFT_SAVED_NEEDS_REVIEW,
+        )
+        self.assertEqual(
+            px500_module._saved_draft_status(editorial, False),
+            UploadStatus.DRAFT_SAVED_NEEDS_REVIEW,
+        )
 
     def test_500px_accepts_only_successful_save_response(self):
         successful = Mock(ok=True)
@@ -717,6 +762,10 @@ class UploadLogicTests(unittest.TestCase):
             _resolve_path("美国怀俄明州大提顿国家公园"),
             ["美国", "怀俄明", "其他"],
         )
+        self.assertEqual(
+            _resolve_path("美国爱达荷州"),
+            ["美国", "爱达荷", "其他"],
+        )
 
     def test_500px_requires_more_than_six_megapixels(self):
         self.assertIn(
@@ -778,6 +827,15 @@ class UploadLogicTests(unittest.TestCase):
 
             def locator(self, selector):
                 return Locator(1 if selector == "text=前往创作者中心" else 0)
+
+        self.assertTrue(px500_module._community_session_ready(Page()))
+
+    def test_500px_recognizes_authenticated_community_redirect_before_render(self):
+        class Page:
+            url = "https://500px.com.cn/community/index.html"
+
+            def locator(self, selector):
+                raise AssertionError("community redirect should not require rendered content")
 
         self.assertTrue(px500_module._community_session_ready(Page()))
 

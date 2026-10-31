@@ -218,14 +218,17 @@ def _chunked(lst, size):
         yield lst[i : i + size]
 
 
-def _run_platform_batch(loaded, batch_fn, limit, label):
+def _run_platform_batch(loaded, batch_fn, limit, label, on_chunk=None):
     """Call batch_fn in chunks of `limit`, return merged results dict."""
     merged = {}
     chunks = list(_chunked(loaded, limit))
     for idx, chunk in enumerate(chunks, 1):
         if len(chunks) > 1:
             print(f"  [{label}] batch {idx}/{len(chunks)} ({len(chunk)} images)", flush=True)
-        merged.update(batch_fn(chunk))
+        batch_results = batch_fn(chunk)
+        merged.update(batch_results)
+        if on_chunk is not None:
+            on_chunk(batch_results)
     return merged
 
 
@@ -252,6 +255,7 @@ def run_upload(
     allow_repeated_metadata: bool = False,
     preserve_all_frames: bool = False,
     repair_corrections: bool = False,
+    repair_adobe_drafts: bool = False,
 ) -> bool:
     from playwright.sync_api import sync_playwright
     import upload.px500 as _px500
@@ -391,13 +395,13 @@ def run_upload(
                 )
             return _run_platform_batch(
                 loaded, lambda chunk: batch_fn(chunk, context),
-                _BATCH_LIMIT[key], key,
+                _BATCH_LIMIT[key], key, on_chunk=lambda batch: record(key, batch),
             )
         if key == "px500":
             _px500.ensure_login(context)
             return _run_platform_batch(
                 loaded, lambda chunk: _px500.upload_batch(chunk, context),
-                _BATCH_LIMIT[key], key,
+                _BATCH_LIMIT[key], key, on_chunk=lambda batch: record(key, batch),
             )
         if key == "tuchong":
             import upload.tuchong as adapter
@@ -407,9 +411,16 @@ def run_upload(
         else:
             import upload.istock as adapter
             adapter.ensure_login(context)
+        batch_fn = (
+            (lambda chunk: adapter.upload_batch(
+                chunk, context, repair_existing_only=repair_adobe_drafts
+            ))
+            if key == "adobestock"
+            else (lambda chunk: adapter.upload_batch(chunk, context))
+        )
         return _run_platform_batch(
-            loaded, lambda chunk: adapter.upload_batch(chunk, context),
-            _BATCH_LIMIT[key], key,
+            loaded, batch_fn,
+            _BATCH_LIMIT[key], key, on_chunk=lambda batch: record(key, batch),
         )
 
     with sync_playwright() as pw:
@@ -508,10 +519,20 @@ def main() -> int:
             "editorial metadata without uploading the files again"
         ),
     )
+    parser.add_argument(
+        "--repair-adobe-drafts",
+        action="store_true",
+        help=(
+            "Fill metadata on matching existing Adobe Stock drafts without "
+            "uploading files that are absent from the draft box"
+        ),
+    )
     args = parser.parse_args()
 
     if args.repair_corrections and args.platform != "shutterstock":
         parser.error("--repair-corrections requires --platform shutterstock")
+    if args.repair_adobe_drafts and args.platform != "adobestock":
+        parser.error("--repair-adobe-drafts requires --platform adobestock")
 
     target = Path(args.directory).expanduser().resolve()
 
@@ -557,6 +578,7 @@ def main() -> int:
         allow_repeated_metadata=args.allow_repeated_metadata,
         preserve_all_frames=args.preserve_all_frames,
         repair_corrections=args.repair_corrections,
+        repair_adobe_drafts=args.repair_adobe_drafts,
     ) else 1
 
 

@@ -104,6 +104,18 @@ class MetadataCoreTests(unittest.TestCase):
             validate_metadata(normalized),
         )
 
+    def test_validate_metadata_rejects_long_shutterstock_keyword_phrase(self):
+        metadata = sample_metadata()
+        metadata["keywords_en"][0] = "orange travertine terraces with dead trees"
+
+        errors = validate_metadata(enforce_limits(metadata))
+
+        self.assertIn(
+            "keywords_en contains a phrase longer than 5 words: "
+            "orange travertine terraces with dead trees",
+            errors,
+        )
+
     def test_invalid_categories_are_not_silently_replaced(self):
         metadata = sample_metadata()
         metadata["category1"] = "Travel"

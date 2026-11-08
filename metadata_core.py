@@ -15,6 +15,7 @@ TITLE_EN_MAX = 70
 TITLE_ZH_MAX = 50
 SHUTTERSTOCK_DESC_MAX = 2048
 SHUTTERSTOCK_KW_MAX = 50
+SHUTTERSTOCK_KW_WORD_MAX = 5
 PX500_DESC_MAX = 50
 PX500_KW_MAX = 35
 ADOBE_KW_MAX = 49
@@ -107,7 +108,7 @@ Platform targets:
 - title_zh: natural Chinese stock title, max {TITLE_ZH_MAX} characters; this is the Chinese-platform title
 - description_en: complete factual English sentence, at least 5 words, max {SHUTTERSTOCK_DESC_MAX} characters
 - description_zh: max {PX500_DESC_MAX} characters; factual Chinese description, not a duplicate keyword list
-- keywords_en: normally 15-25 relevant lowercase terms; minimum 7 and maximum {SHUTTERSTOCK_KW_MAX}; use fewer rather than pad
+- keywords_en: normally 15-25 relevant lowercase terms; minimum 7 and maximum {SHUTTERSTOCK_KW_MAX}; each keyword phrase is at most {SHUTTERSTOCK_KW_WORD_MAX} words; use fewer rather than pad
 - keywords_zh: normally 8-20 relevant terms; minimum 5 and maximum {PX500_KW_MAX}; use fewer rather than pad
 - Keep the first 10 English keywords especially strong; Adobe uses the first {ADOBE_KW_MAX}
 - Order English keywords as: exact primary subject first, then action/setting, then visual attributes and well-supported concepts. The first three must identify the primary subject.
@@ -568,6 +569,12 @@ def validate_metadata(result: dict) -> list[str]:
         errors.append("keywords_zh must contain at least 5 unique keywords")
     if len(result.get("keywords_en", [])) > SHUTTERSTOCK_KW_MAX:
         errors.append(f"keywords_en exceeds {SHUTTERSTOCK_KW_MAX} keywords")
+    for keyword in result.get("keywords_en", []):
+        if len(keyword.split()) > SHUTTERSTOCK_KW_WORD_MAX:
+            errors.append(
+                "keywords_en contains a phrase longer than "
+                f"{SHUTTERSTOCK_KW_WORD_MAX} words: {keyword}"
+            )
     if len(result.get("keywords_zh", [])) > PX500_KW_MAX:
         errors.append(f"keywords_zh exceeds {PX500_KW_MAX} keywords")
     if len(result.get("core_keywords_zh", [])) > 5:

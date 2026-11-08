@@ -4,7 +4,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 # Pure upload rules should remain testable without launching or installing a browser.
 if "playwright.sync_api" not in sys.modules:
@@ -487,6 +487,106 @@ class UploadLogicTests(unittest.TestCase):
                 return Body()
 
         self.assertEqual(_portfolio_page_count(Page()), 5)
+
+    def test_shutterstock_validation_response_alone_is_not_save_success(self):
+        image = Path("DSC0001.jpg")
+        metadata = {"description_en": "A mountain landscape under blue sky."}
+        description = Mock()
+        description.input_value.return_value = metadata["description_en"]
+        save_button = Mock()
+        response = Mock(ok=True)
+        response.json.return_value = {
+            "mediaStatus": [{"id": "1", "status": "ready"}]
+        }
+        response_info = Mock(value=response)
+        response_context = MagicMock()
+        response_context.__enter__.return_value = response_info
+        page = Mock()
+        page.locator.side_effect = lambda selector: (
+            description if selector == "textarea[name='description']" else save_button
+        )
+        page.expect_response.return_value = response_context
+
+        with patch.object(
+            shutterstock_module, "_submission_mode", return_value=("commercial", "")
+        ), patch.object(
+            shutterstock_module, "_ensure_english_metadata_language"
+        ), patch.object(
+            shutterstock_module, "_replace_keywords"
+        ), patch.object(
+            shutterstock_module, "_set_usage", return_value=True
+        ), patch.object(
+            shutterstock_module, "_set_categories", return_value=True
+        ), patch.object(
+            shutterstock_module, "platform_category", return_value=["Nature"]
+        ), patch.object(
+            shutterstock_module, "_confirm_saved_draft", return_value=False
+        ) as confirm:
+            saved = shutterstock_module._fill_metadata(
+                page,
+                image,
+                metadata,
+                portfolio_page_number=3,
+            )
+
+        self.assertFalse(saved)
+        confirm.assert_called_once_with(
+            page,
+            image.name,
+            3,
+            allow_needs_review=False,
+            expected_description=metadata["description_en"],
+            expected_keywords=[],
+            expected_categories=("Nature", ""),
+        )
+
+    def test_shutterstock_review_draft_is_verified_after_reload(self):
+        card = Mock()
+        card.inner_text.return_value = "DSC0001.jpg Needs attention"
+        card.bounding_box.return_value = {
+            "x": 10,
+            "y": 20,
+            "width": 200,
+            "height": 100,
+        }
+        category1 = Mock()
+        category1.inner_text.return_value = "Nature"
+        category2 = Mock()
+        category2.inner_text.return_value = "Parks/Outdoor"
+        description = Mock()
+        description.input_value.return_value = "A factual landscape description."
+        page = Mock()
+        page.locator.side_effect = lambda selector: {
+            "[data-testid='category1']": category1,
+            "[data-testid='category2']": category2,
+            "textarea[name='description']": description,
+        }[selector]
+
+        with patch.object(
+            shutterstock_module, "_dismiss_cookie_consent"
+        ), patch.object(
+            shutterstock_module, "_find_asset_card", return_value=card
+        ), patch.object(
+            shutterstock_module,
+            "_selected_keyword_values",
+            return_value=["mountain", "national park"],
+        ):
+            confirmed = shutterstock_module._confirm_saved_draft(
+                page,
+                "DSC0001.jpg",
+                2,
+                allow_needs_review=True,
+                expected_description="A factual landscape description.",
+                expected_keywords=["mountain", "national park"],
+                expected_categories=("Nature", "Parks/Outdoor"),
+            )
+
+        self.assertTrue(confirmed)
+        page.goto.assert_called_once_with(
+            shutterstock_module._portfolio_page_url(2),
+            wait_until="domcontentloaded",
+            timeout=20_000,
+        )
 
     def test_shutterstock_ambiguous_asset_does_not_abort_batch(self):
         class Card:

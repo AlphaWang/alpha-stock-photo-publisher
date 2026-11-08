@@ -27,7 +27,6 @@ from urllib.parse import urlparse
 from playwright.sync_api import BrowserContext, TimeoutError as PWTimeout
 
 from .browser import ensure_logged_in
-from .confirmation import wait_for_success_text
 from .status import UploadStatus
 from metadata_core import (
     EDITORIAL_DATE_SOURCES,
@@ -467,7 +466,88 @@ def _wait_for_resubmitted_asset(
     return False
 
 
-def _fill_metadata(page, img: Path, meta: dict, *, correction: bool = False) -> bool:
+def _wait_for_ready_asset(
+    page,
+    image_name: str,
+    *,
+    timeout_ms: int = 10_000,
+) -> bool:
+    """Wait until the exact portfolio card reports Ready to submit."""
+    elapsed = 0
+    interval_ms = 250
+    while elapsed < timeout_ms:
+        card = _find_asset_card(page, image_name)
+        if card is not None and _asset_card_is_ready(card.inner_text()):
+            return True
+        page.wait_for_timeout(interval_ms)
+        elapsed += interval_ms
+    return False
+
+
+def _confirm_saved_draft(
+    page,
+    image_name: str,
+    page_number: int,
+    *,
+    allow_needs_review: bool = False,
+    expected_description: str = "",
+    expected_keywords: list[str] | None = None,
+    expected_categories: tuple[str, str] = ("", ""),
+) -> bool:
+    """Verify a durable save from a freshly loaded portfolio state."""
+    if not allow_needs_review and _wait_for_ready_asset(page, image_name):
+        return True
+
+    page.goto(
+        _portfolio_page_url(page_number),
+        wait_until="domcontentloaded",
+        timeout=20_000,
+    )
+    _dismiss_cookie_consent(page)
+    page.wait_for_timeout(400)
+    if not allow_needs_review:
+        return _wait_for_ready_asset(page, image_name, timeout_ms=5_000)
+
+    card = _find_asset_card(page, image_name)
+    if card is None:
+        return False
+    if _asset_card_is_ready(card.inner_text()):
+        return True
+
+    # Assets with unresolved rights/release evidence are intentionally not
+    # Ready to submit. Reopen the draft after reload and compare the persisted
+    # fields instead of trusting the validation response or an in-memory form.
+    card.scroll_into_view_if_needed()
+    bbox = card.bounding_box()
+    page.mouse.click(
+        bbox["x"] + bbox["width"] / 2,
+        bbox["y"] + bbox["height"] * 0.35,
+    )
+    filename = json.dumps(image_name, ensure_ascii=False)
+    page.wait_for_selector(f"h3:has-text({filename})", timeout=20_000)
+    page.wait_for_timeout(400)
+
+    actual_categories = (
+        _canonical_category(page.locator("[data-testid='category1']").inner_text()),
+        _canonical_category(page.locator("[data-testid='category2']").inner_text()),
+    )
+    return (
+        page.locator("textarea[name='description']").input_value()
+        == expected_description
+        and _selected_keyword_values(page)
+        == _normalized_keyword_values(expected_keywords or [])
+        and actual_categories == expected_categories
+    )
+
+
+def _fill_metadata(
+    page,
+    img: Path,
+    meta: dict,
+    *,
+    correction: bool = False,
+    portfolio_page_number: int = 1,
+) -> bool:
     """Fill safe draft metadata, even when a release still needs review."""
     usage, review_reason = _submission_mode(meta)
     if correction and review_reason:
@@ -573,59 +653,27 @@ def _fill_metadata(page, img: Path, meta: dict, *, correction: bool = False) -> 
         # The returned-asset card is authoritative and changes to Resubmitted.
         return _wait_for_resubmitted_asset(page, img.name)
 
-    if save_response is not None and not review_reason:
-        return True
-
-    page.wait_for_timeout(1_200)
-    card = _find_asset_card(page, img.name)
-    if card is not None and _asset_card_is_ready(card.inner_text()):
-        return True
-
-    # The portfolio card can lag behind a successful save until the next reload.
-    # Accept the persisted form state when all required fields remain intact and
-    # Shutterstock shows no validation alert.
-    categories_match = (
-        _canonical_category(page.locator("[data-testid='category1']").inner_text())
-        == cat1
-        and _canonical_category(page.locator("[data-testid='category2']").inner_text())
-        == cat2
+    # The validation endpoint only confirms that the submitted fields are
+    # acceptable.  It is not a durable-save acknowledgement: closing the page
+    # at this point can race Shutterstock's later state update.  The exact
+    # portfolio card is authoritative for ready assets. Rights-review drafts
+    # are reloaded and compared field-by-field because they cannot become Ready.
+    confirmed = _confirm_saved_draft(
+        page,
+        img.name,
+        portfolio_page_number,
+        allow_needs_review=bool(review_reason),
+        expected_description=desc_text,
+        expected_keywords=meta.get("keywords_en", []),
+        expected_categories=(cat1, cat2),
     )
-    keyword_count = _keyword_count_from_text(page.locator("body").inner_text())
-    validation_error = page.locator(
-        ".MuiAlert-standardError:visible, [role='alert']:visible"
-    ).count()
-    if (
-        desc_area.input_value() == desc_text
-        and categories_match
-        and keyword_count >= 7
-        and (review_reason or validation_error == 0)
-    ):
-        return True
-
-    if card is not None:
-        try:
-            card.wait_for(state="visible", timeout=4_000)
-            if _asset_card_is_ready(card.inner_text()):
-                return True
-        except PWTimeout:
-            pass
-    if wait_for_success_text(
-        page, ["saved", "changes saved", "asset saved", "已保存"], timeout=1_000
-    ):
-        return True
-    try:
-        page.wait_for_function(
-            """() => {
-                const button = document.querySelector(
-                    '[data-testid="edit-dialog-save-button"]'
-                );
-                return !button || button.disabled || button.getAttribute('aria-disabled') === 'true';
-            }""",
-            timeout=2_000,
+    if not confirmed:
+        print(
+            f"  [review] {img.name}: Shutterstock card did not become "
+            "Ready or retain the expected metadata after save and reload",
+            flush=True,
         )
-        return True
-    except PWTimeout:
-        return False
+    return confirmed
 
 
 def upload_batch(
@@ -755,7 +803,12 @@ def upload_batch(
                             bbox["y"] + bbox["height"] * 0.35,
                         )
 
-                        if not _fill_metadata(page, img, meta):
+                        if not _fill_metadata(
+                            page,
+                            img,
+                            meta,
+                            portfolio_page_number=page_number,
+                        ):
                             raise RuntimeError("save was not confirmed")
                         _usage, review_reason = _submission_mode(meta)
                         if review_reason:

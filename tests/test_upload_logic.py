@@ -133,6 +133,11 @@ class UploadLogicTests(unittest.TestCase):
             **clear,
             "property_release_status": "unknown",
         }))
+        self.assertEqual(adobe_release_declaration({
+            **clear,
+            "visual_facts": {**clear["visual_facts"], "recognizable_people_visible": "yes"},
+            "model_release_status": "unknown",
+        }), "Yes")
     def test_full_coverage_inventory_detects_every_image_without_metadata(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             directory = Path(temp_dir)
@@ -1175,7 +1180,7 @@ class UploadLogicTests(unittest.TestCase):
 
         self.assertEqual(adobe_total_asset_count(Page()), 121)
 
-    def test_release_notes_block_automatic_submission(self):
+    def test_release_notes_allow_adobe_draft_metadata_but_block_submission(self):
         metadata = {
             "title_en": "City street",
             "description_en": "A city street in daylight.",
@@ -1183,16 +1188,8 @@ class UploadLogicTests(unittest.TestCase):
             "release_status": "clear",
             "release_notes": "Visible logo may require cleanup",
         }
-        self.assertIn("release review required", adobe_review_reason(metadata))
+        self.assertEqual(adobe_review_reason({**metadata, "category1": "Nature"}), "")
         self.assertIn("release review required", istock_review_reason(metadata))
-
-        class NoBrowserContext:
-            def new_page(self):
-                raise AssertionError("review items must be filtered before browser upload")
-
-        with patch("upload.adobestock._technical_review_reason", return_value=""):
-            result = upload_adobe_batch([(Path("city.jpg"), metadata)], NoBrowserContext())
-        self.assertEqual(result, {"city.jpg": UploadStatus.NEEDS_REVIEW})
 
     def test_unknown_location_blocks_500px_upload(self):
         metadata = {

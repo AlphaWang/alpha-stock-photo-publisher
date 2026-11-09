@@ -112,6 +112,10 @@ def ensure_logged_in(
             # original request while redirecting. Keep the browser open for
             # manual login; the explicit session check below remains authoritative.
             pass
+        try:
+            page.bring_to_front()
+        except (AttributeError, PlaywrightError):
+            pass
         if prepare_login is not None:
             prepare_login()
         try:

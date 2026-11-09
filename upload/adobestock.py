@@ -84,9 +84,6 @@ def _auto_review_reason(meta: dict) -> str:
     keyword_count = len(meta.get("keywords_en", [])[:49])
     if keyword_count < 5:
         return f"only {keyword_count} keywords (min 5 required)"
-    commercial_reason = commercial_submission_review_reason(meta)
-    if commercial_reason:
-        return commercial_reason
     if _category_for_metadata(meta) is None:
         return "category cannot be mapped to Adobe Stock"
     return ""
@@ -104,8 +101,13 @@ def _release_declaration(meta: dict) -> Optional[str]:
         and meta.get("copyrighted_content_status") == "none"
     ):
         return "No"
-    # A "Yes" answer also needs the matching release attached in Adobe.
-    # The uploader does not perform that attachment, so leave it for review.
+    if (
+        facts.get("recognizable_people_visible") == "yes"
+        or facts.get("private_property_visible") == "yes"
+    ):
+        # The declaration is factual; submission remains blocked until the
+        # matching release is present and verified in Adobe.
+        return "Yes"
     return None
 
 
@@ -343,39 +345,12 @@ def _fill_metadata(page: Page, img: Path, meta: dict) -> bool:
     if len(keywords) < 5:
         print(f"  [review] {img.name}: only {len(keywords)} keywords (min 5 required)")
         return False
-    commercial_reason = commercial_submission_review_reason(meta)
-    if commercial_reason:
-        print(f"  [review] {img.name}: {commercial_reason}")
-        return False
-
     try:
         title_ta = page.locator("[data-t='asset-title-content-tagger']").first
         title_ta.wait_for(state="visible", timeout=15_000)
         title_ta.fill(title)
     except PWTimeout:
         print(f"  [warn] {img.name}: title textarea not found")
-        return False
-
-    # Never infer "No" from a generic commercial status or an absent release.
-    # Unknown visual evidence must remain for contributor review.
-    declaration = _release_declaration(meta)
-    if declaration is None:
-        print(f"  [review] {img.name}: Adobe people/property declaration needs review")
-        return False
-    try:
-        control = page.get_by_role("button", name=declaration, exact=True).first
-        if control.count() == 0:
-            suffix = declaration.lower()
-            control = page.locator(
-                f"label:has([data-t='has-release-{suffix}']) span.switch__body"
-            ).first
-        if control.count() == 0:
-            print(f"  [warn] {img.name}: release declaration control not found")
-            return False
-        control.click()
-        page.wait_for_timeout(200)
-    except Exception as e:
-        print(f"  [warn] {img.name}: release declaration failed — {e}")
         return False
 
     # Keywords — erase Sensei pre-fills, then paste ours (min 5, max 49)
@@ -424,6 +399,29 @@ def _fill_metadata(page: Page, img: Path, meta: dict) -> bool:
             return False
 
     page.wait_for_timeout(300)
+
+    # Fill the factual fields even when rights are uncertain. Adobe may block
+    # Save work until this declaration is answered; in that case the accepted
+    # upload remains a draft for contributor review and is never submitted.
+    declaration = _release_declaration(meta)
+    if declaration is None:
+        print(f"  [review] {img.name}: Adobe people/property declaration needs review")
+        return False
+    try:
+        control = page.get_by_role("button", name=declaration, exact=True).first
+        if control.count() == 0:
+            suffix = declaration.lower()
+            control = page.locator(
+                f"label:has([data-t='has-release-{suffix}']) span.switch__body"
+            ).first
+        if control.count() == 0:
+            print(f"  [warn] {img.name}: release declaration control not found")
+            return False
+        control.click()
+        page.wait_for_timeout(200)
+    except Exception as e:
+        print(f"  [warn] {img.name}: release declaration failed — {e}")
+        return False
 
     # Save — button is disabled until title + keywords + property-release are all filled
     try:
@@ -591,15 +589,28 @@ def upload_batch(
 
         # A global submit action may include pre-existing drafts. Leave this batch
         # saved for review unless the uploads page was empty before this run.
+        metadata_by_name = {img.name: meta for img, meta in pairs}
+        review_saved_names = {
+            name for name in saved_names
+            if commercial_submission_review_reason(metadata_by_name[name])
+        }
+
+        def mark_saved_drafts() -> None:
+            for name in saved_names:
+                results[name] = (
+                    UploadStatus.DRAFT_SAVED_NEEDS_REVIEW
+                    if name in review_saved_names
+                    else UploadStatus.DRAFT_SAVED
+                )
+
         try:
             if not saved_names:
                 print("  [warn] No Adobe assets were ready to submit", flush=True)
                 return results
-            if pre_count > 0:
-                for name in saved_names:
-                    results[name] = UploadStatus.DRAFT_SAVED
+            if pre_count > 0 or review_saved_names:
+                mark_saved_drafts()
                 print(
-                    "  [review] Adobe had pre-existing drafts; new work was saved but not submitted",
+                    "  [review] Adobe drafts saved; existing assets or release reviews prevent batch submission",
                     flush=True,
                 )
                 return results
@@ -615,12 +626,13 @@ def upload_batch(
                     results[name] = UploadStatus.SUBMITTED
                 print("  Submitted to Adobe Stock moderation.", flush=True)
             else:
-                for name in saved_names:
-                    results[name] = UploadStatus.DRAFT_SAVED
+                mark_saved_drafts()
                 print("  [review] Adobe submission was not confirmed; work remains saved", flush=True)
         except PWTimeout:
+            mark_saved_drafts()
             print("  [warn] Submit button still disabled — check that at least one file was saved", flush=True)
         except Exception as e:
+            mark_saved_drafts()
             print(f"  [warn] Submit failed: {e}", flush=True)
 
     except Exception as e:
